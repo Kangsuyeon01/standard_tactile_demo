@@ -552,6 +552,19 @@ def main(args):
     print(f"  Elapsed  : {report['elapsed_human']}")
     print(f"{sep}")
 
+    # ── Auto eval ────────────────────────────────────────────────────────────
+    if not getattr(args, "no_eval", False):
+        print("\n[AUTO EVAL] Running eval_roughness_signal.py ...")
+        import subprocess, sys as _sys
+        result = subprocess.run(
+            [_sys.executable, "-m", "scripts.eval_roughness_signal",
+             "--run-id", run_id,
+             "--out-dir", str(out_dir)],
+            cwd=Path(__file__).resolve().parent.parent,
+        )
+        if result.returncode != 0:
+            print("[AUTO EVAL] eval_roughness_signal.py failed (exit code",
+                  result.returncode, ")")
 
 
 # ── Argparse ──────────────────────────────────────────────────────────────────
@@ -574,6 +587,8 @@ def build_args():
                    help="Spectral centroid loss weight (0 = disabled)")
     p.add_argument("--lambda-hf",       type=float, default=0.5,
                    help="HF energy ratio contrastive loss weight (0 to disable)")
+    p.add_argument("--no-eval", action="store_true",
+                   help="Skip automatic eval_roughness_signal.py after training")
     return p.parse_args()
 
 
