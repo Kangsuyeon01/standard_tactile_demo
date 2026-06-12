@@ -260,6 +260,11 @@ class LiteSeq2SeqCNNGRU_AttnPool(nn.Module):
             nn.GELU(),
             nn.Linear(64, output_steps),
         )
+        # Force/velocity gate: 마지막 샘플 (f, v) → sigmoid scalar [0, 1]
+        self.gate_net = nn.Sequential(
+            nn.Linear(2, 16), nn.ReLU(),
+            nn.Linear(16, 1), nn.Sigmoid(),
+        )
 
     def forward(self, x):
         r  = x[:, 3, 0:1]              # [B, 1] roughness 0~1
@@ -273,7 +278,12 @@ class LiteSeq2SeqCNNGRU_AttnPool(nn.Module):
         h, _ = self.gru(h)                        # [B, T, 32]
         w  = torch.softmax(self.attn(h), dim=1)   # [B, T, 1]
         ctx = (h * w).sum(dim=1)                  # [B, 32]
-        return self.head(ctx)                     # [B, 40]
+        out = self.head(ctx)                      # [B, output_steps]
+        # 마지막 force/vel 샘플로 즉시 반응하는 학습된 gate
+        f_curr = x[:, 1, -1:]   # [B, 1]
+        v_curr = x[:, 2, -1:]   # [B, 1]
+        gate = self.gate_net(torch.cat([f_curr, v_curr], dim=1))  # [B, 1]
+        return out * gate                         # [B, output_steps]
 
 
 # =========================================================
