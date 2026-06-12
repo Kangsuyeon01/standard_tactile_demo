@@ -731,6 +731,12 @@ class RealtimeReferenceGuidedGenerator:
 
         return np.asarray(out_final, dtype=np.float32), None
 
+    def override_last_output(self, signal):
+        """post-processing(gate 등) 적용 후 신호를 acc_buf에 반영.
+        gate로 줄어든 출력이 다음 예측의 입력에도 반영되도록 한다."""
+        n = min(len(signal), self.input_steps)
+        self.acc_buf[-n:] = np.asarray(signal[:n], dtype=np.float32)
+
 # =========================================================
 # 5) Live plot mode
 # =========================================================
@@ -889,6 +895,7 @@ def run_live_plot(args):
             acc = apply_common_output_limit(acc, r, velocity=v)
         if not args.no_force_gate:
             acc = force_velocity_gate(acc, f, v)
+        rt_holder[0].override_last_output(acc)
 
         acc_buf.extend(acc.tolist())
         data    = np.asarray(acc_buf, dtype=np.float32)
@@ -1079,6 +1086,7 @@ def start_socket_server(args):
                     if not args.no_enhance_roughness: acc = enhance_acc_by_roughness(acc, roughness, rng=rng)
                     if not args.no_output_limit: acc = apply_common_output_limit(acc, roughness, velocity=speed)
                     if not args.no_force_gate: acc = force_velocity_gate(acc, force_mag, speed)
+                    rt.override_last_output(acc)
                     wave_data = acc_to_uint16_wave(acc, device_num=int(user_id)%2, channel_num=int(fingerIdx))
                     client_socket.sendall(struct.pack(f"<{num_samples}H", *wave_data))
 
