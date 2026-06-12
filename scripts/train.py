@@ -298,24 +298,50 @@ def spectral_profile_loss(pred: torch.Tensor,
 
 def force_contrastive_loss(pred: torch.Tensor,
                             force_values: torch.Tensor,
-                            min_f_diff: float = 0.3) -> torch.Tensor:
+                            vel_values: torch.Tensor | None = None,
+                            min_f_diff: float = 0.3,
+                            vel_thresh: float = 0.005) -> torch.Tensor:
     """
     Force 높은 쪽의 RMS >= Force 낮은 쪽의 RMS 를 강제.
-    min_f_diff(N) 이상 차이나는 쌍만 고려.
-
-    force_values: [B]  (un-normalized, N 단위)
+    velocity 낮은 샘플은 제외 — transition aug 샘플(low vel → Y≈0)과 충돌 방지.
     """
     pred_rms = torch.sqrt(torch.mean(pred ** 2, dim=1) + 1e-8)  # [B]
     f = force_values.float()
 
-    # f_i - f_j  > min_f_diff  -->  rms_i should be >= rms_j
-    f_diff   = f.unsqueeze(1) - f.unsqueeze(0)      # [B, B]: row=i, col=j -> f_i - f_j
-    rms_diff = pred_rms.unsqueeze(1) - pred_rms.unsqueeze(0)  # rms_i - rms_j
+    # velocity 충분한 샘플만 비교 (양쪽 모두 vel >= thresh)
+    if vel_values is not None:
+        v = vel_values.float()
+        active = (v >= vel_thresh)
+        active_pair = active.unsqueeze(0) & active.unsqueeze(1)  # [B, B]
+    else:
+        active_pair = torch.ones(len(f), len(f), dtype=torch.bool, device=f.device)
 
-    mask      = (f_diff > min_f_diff).float()
-    violation = torch.relu(-rms_diff)               # penalize when rms_i < rms_j
+    f_diff   = f.unsqueeze(1) - f.unsqueeze(0)
+    rms_diff = pred_rms.unsqueeze(1) - pred_rms.unsqueeze(0)
+
+    mask      = (f_diff > min_f_diff).float() * active_pair.float()
+    violation = torch.relu(-rms_diff)
     count     = mask.sum().clamp(min=1)
     return (violation * mask).sum() / count
+
+
+def vel_gate_loss(pred: torch.Tensor,
+                  vel_values: torch.Tensor,
+                  force_values: torch.Tensor,
+                  vel_thresh: float = 0.005,
+                  force_thresh: float = 0.3) -> torch.Tensor:
+    """
+    Force는 충분한데 velocity가 낮으면 출력이 0에 가까워야 함.
+    transition aug만으로 부족한 velocity gating을 loss로 직접 강제.
+    """
+    pred_rms = torch.sqrt(torch.mean(pred ** 2, dim=1) + 1e-8)
+    f = force_values.float()
+    v = vel_values.float()
+
+    mask = (f >= force_thresh) & (v < vel_thresh)
+    if mask.sum() < 1:
+        return torch.tensor(0.0, device=pred.device, requires_grad=True)
+    return torch.mean(pred_rms[mask] ** 2)  # 해당 샘플 RMS를 0으로
 
 
 def roughness_cls_loss(ctx: torch.Tensor,
@@ -335,19 +361,21 @@ def roughness_cls_loss(ctx: torch.Tensor,
     return nn.functional.cross_entropy(logits, labels)
 
 
-def combined_loss(pred, ctx, target, roughness_values, force_values, roughness_head,
+def combined_loss(pred, ctx, target, roughness_values, force_values, vel_values, roughness_head,
                   lambda_rms=2.0, lambda_contrast=0.6,
                   lambda_centroid=0.0, lambda_hf=0.0,
-                  lambda_force=1.0, lambda_profile=2.0, lambda_rough_cls=1.0):
+                  lambda_force=1.0, lambda_profile=2.0, lambda_rough_cls=1.0,
+                  lambda_vel_gate=2.0):
     base_loss, loss_dict = total_loss(pred, target)
 
     l_rms       = roughness_rms_calibration_loss(pred, roughness_values, force_values)
     l_contrast  = roughness_contrastive_loss(pred, roughness_values)
     l_centroid  = spectral_centroid_loss(pred, roughness_values)
     l_hf        = hf_energy_ratio_loss(pred, roughness_values)
-    l_force     = force_contrastive_loss(pred, force_values)
+    l_force     = force_contrastive_loss(pred, force_values, vel_values)
     l_profile   = spectral_profile_loss(pred, roughness_values)
     l_rough_cls = roughness_cls_loss(ctx, roughness_values, roughness_head)
+    l_vel_gate  = vel_gate_loss(pred, vel_values, force_values)
 
     total = (base_loss
              + lambda_rms       * l_rms
@@ -356,7 +384,8 @@ def combined_loss(pred, ctx, target, roughness_values, force_values, roughness_h
              + lambda_hf        * l_hf
              + lambda_force     * l_force
              + lambda_profile   * l_profile
-             + lambda_rough_cls * l_rough_cls)
+             + lambda_rough_cls * l_rough_cls
+             + lambda_vel_gate  * l_vel_gate)
 
     loss_dict.update({
         "rms_calib":  l_rms.item(),
@@ -366,6 +395,7 @@ def combined_loss(pred, ctx, target, roughness_values, force_values, roughness_h
         "force_ctr":  l_force.item(),
         "profile":    l_profile.item(),
         "rough_cls":  l_rough_cls.item(),
+        "vel_gate":   l_vel_gate.item(),
         "total":      total.item(),
     })
     return total, loss_dict
@@ -378,13 +408,13 @@ def run_epoch(loader, model, optimizer, device, args, train=True):
 
     keys = ("point", "diff", "spec", "env",
             "rms_calib", "contrast", "centroid", "hf_ratio",
-            "force_ctr", "profile", "rough_cls", "total")
+            "force_ctr", "profile", "rough_cls", "vel_gate", "total")
     loss_log  = {k: 0.0 for k in keys}
     total_count = 0
     preds_all, trues_all = [], []
 
     for xb, yb, rb, fb, vb in loader:
-        xb, yb, rb, fb = xb.to(device), yb.to(device), rb.to(device), fb.to(device)
+        xb, yb, rb, fb, vb = xb.to(device), yb.to(device), rb.to(device), fb.to(device), vb.to(device)
 
         if train:
             optimizer.zero_grad()
@@ -392,7 +422,7 @@ def run_epoch(loader, model, optimizer, device, args, train=True):
         with torch.set_grad_enabled(train):
             pred, ctx = model(xb, return_ctx=True)
             loss, loss_dict = combined_loss(
-                pred, ctx, yb, rb, fb, model.roughness_head,
+                pred, ctx, yb, rb, fb, vb, model.roughness_head,
                 lambda_rms=args.lambda_rms,
                 lambda_contrast=args.lambda_contrast,
                 lambda_centroid=args.lambda_centroid,
@@ -400,6 +430,7 @@ def run_epoch(loader, model, optimizer, device, args, train=True):
                 lambda_force=args.lambda_force,
                 lambda_profile=args.lambda_profile,
                 lambda_rough_cls=args.lambda_rough_cls,
+                lambda_vel_gate=args.lambda_vel_gate,
             )
             if train:
                 loss.backward()
@@ -847,6 +878,8 @@ def build_args():
                    help="Spectral profile loss: match roughness-specific FFT shape from training data")
     p.add_argument("--lambda-rough-cls", type=float, default=1.0,
                    help="Roughness cls loss on hidden ctx (train-only, zero inference overhead)")
+    p.add_argument("--lambda-vel-gate", type=float, default=2.0,
+                   help="Velocity gate loss: force 있는데 vel 낮으면 출력 0으로 강제")
     p.add_argument("--epochs", type=int, default=None,
                    help="학습 epoch 수 (미지정 시 src.config.EPOCHS 사용)")
     p.add_argument("--no-eval", action="store_true")
