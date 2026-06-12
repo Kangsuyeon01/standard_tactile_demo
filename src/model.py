@@ -24,7 +24,7 @@ class LiteSeq2SeqCNNGRU_AttnPool(nn.Module):
     생기지만, FiLM 을 쓰면 roughness 가 직접 feature map 을 조절한다.
     """
 
-    def __init__(self, in_ch: int = 3, output_steps: int = 40):
+    def __init__(self, in_ch: int = 3, output_steps: int = 40, n_roughness_classes: int = 7):
         # in_ch: dynamic 채널 수 (acc, force, vel). roughness 는 별도 처리.
         super().__init__()
 
@@ -53,8 +53,12 @@ class LiteSeq2SeqCNNGRU_AttnPool(nn.Module):
         self.head = nn.Sequential(
             nn.Linear(32, 64), nn.GELU(), nn.Linear(64, output_steps),
         )
+        # Auxiliary roughness classification head (train-only, not used at inference)
+        self.roughness_head = nn.Sequential(
+            nn.Linear(32, 16), nn.GELU(), nn.Linear(16, n_roughness_classes),
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_ctx: bool = False):
         r = x[:, 3, 0:1]               # [B, 1]  roughness 0~1 (상수 채널)
         h = self.conv1(x[:, :3, :])    # [B, 24, T]  dynamic 3채널만
         h = self.conv2(h)              # [B, 32, T]
@@ -69,7 +73,10 @@ class LiteSeq2SeqCNNGRU_AttnPool(nn.Module):
         h, _ = self.gru(h)                       # [B, T, 32]
         w   = torch.softmax(self.attn(h), dim=1) # [B, T, 1]
         ctx = (h * w).sum(dim=1)                 # [B, 32]
-        return self.head(ctx)                    # [B, output_steps]
+        out = self.head(ctx)                     # [B, output_steps]
+        if return_ctx:
+            return out, ctx
+        return out
 
 
 # ──────────────────────────────────────────────────────────────────────────────

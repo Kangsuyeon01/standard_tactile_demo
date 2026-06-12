@@ -3,3 +3,5 @@ pandas>=2.0
 torch>=2.0
 matplotlib>=3.7
 nidaqmx>=0.6          # NI-DAQmx Python wrapper (Windows only)
+onnx>=1.14            # ONNX export (realtime.py --onnx-path)
+onnxruntime>=1.16     # ONNX Runtime 추론 (PyTorch 대비 ~24x 빠름)

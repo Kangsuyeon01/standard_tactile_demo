@@ -1,0 +1,7 @@
+Inference timing  (20260612-003)
+  n_calls : 12600
+  mean    : 1.051 ms
+  median  : 0.935 ms
+  p95     : 1.556 ms
+  min/max : 0.795 / 11.143 ms
+  target  : 5.0 ms -> OK

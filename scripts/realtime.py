@@ -15,23 +15,23 @@ rng = np.random.default_rng(1234)
 
 GLOVE_FILTERS = {
     "Glove5_CH1": {
-        "b": [3.83838151e+03, -9.88903461e+03, 9.15774314e+03, -3.00465678e+03],
+        "b": [7.67676360e+02, -1.97780692e+03, 1.83154863e+03, -6.00931356e+02],
         "a": [1.00000000e+00, -2.64603348e+00, 2.49329490e+00, -8.32688261e-01]
     },
     "Glove5_CH2": {
-        "b": [3.97156983e+03, -1.01299560e+04, 9.47725719e+03, -3.20027171e+03],
+        "b": [7.94313966e+02, -2.02599120e+03, 1.89545144e+03, -6.40054344e+02],
         "a": [1.00000000e+00, -2.59317456e+00, 2.44663879e+00, -8.35278615e-01]
     },
     "Glove3_CH1": {
-        "b": [3.10421854e+04, -7.96214502e+04, 7.34110294e+04, -2.38521743e+04],
+        "b": [1.55210927e+04, -3.98107251e+04, 3.67055147e+04, -1.19260871e+04],
         "a": [1.00000000e+00, -2.63140512e+00, 2.47158320e+00, -8.24619541e-01]
     },
     "Glove3_CH2": {
-        "b": [3.14915273e+04, -8.04112954e+04, 7.55120481e+04, -2.59104218e+04],
+        "b": [1.57457636e+04, -4.02056477e+04, 3.77560241e+04, -1.29552109e+04],
         "a": [1.00000000e+00, -2.57841523e+00, 2.42910457e+00, -8.41029514e-01]
     },
     "Glove3_CH3": {
-        "b": [3.21042915e+04, -8.18491024e+04, 7.62910457e+04, -2.48102941e+04],
+        "b": [1.60521457e+04, -4.09245512e+04, 3.81455229e+04, -1.24051471e+04],
         "a": [1.00000000e+00, -2.61042951e+00, 2.45841029e+00, -8.29104257e-01]
     }
 }
@@ -84,48 +84,94 @@ def hard_clip_by_median(signal, ratio=5.0):
     return np.clip(x, -limit, limit).astype(np.float32)
 
 
-def roughness_to_target_rms(roughness, rms_min=0.20, rms_max=0.30, gamma=0.85):
+def roughness_to_target_rms(roughness, velocity=0.05, rms_min=0.18, rms_max=0.90, gamma=0.60):
     r = np.clip(float(roughness) / 100.0, 0.0, 1.0)
-    return float(rms_min + (rms_max - rms_min) * (r ** gamma))
+    base_rms = rms_min + (rms_max - rms_min) * (r ** gamma)
+
+    # Velocity-dependent gain — derived from analyze_velocity_spectrum.py
+    # Rough surfaces (R=100) show ~43% RMS increase over 0.01→0.15 m/s
+    # Smooth surfaces (R=5) show ~0% change
+    # Formula: vel_gain_coeff = 0.45 * r^1.5
+    #   r=0.05 → 0.005 (~0%)  r=0.45 → 0.136 (~14%)  r=1.0 → 0.45 (~45%)
+    v = np.clip(float(velocity), 0.0, 0.25)
+    vel_gain_coeff = 0.45 * (r ** 1.5)
+    v_norm = np.clip((v - 0.01) / 0.14, 0.0, 1.0)
+    return float(base_rms * (1.0 + vel_gain_coeff * v_norm))
 
 
-def apply_common_output_limit(signal, roughness):
+def force_velocity_gate(signal, force, velocity,
+                        force_thresh=0.3, vel_thresh=0.005,
+                        force_full=2.0,  vel_full=0.03):
+    """
+    force 또는 velocity가 낮을 때 출력 amplitude를 0 쪽으로 감쇄.
+    - force < force_thresh  또는  vel < vel_thresh → 거의 0
+    - force >= force_full   AND  vel >= vel_full   → gain=1 (감쇄 없음)
+    두 축의 gain을 곱해서 최종 gate를 만든다.
+    """
+    f = float(force)
+    v = float(velocity)
+    f_gain = float(np.clip((f - force_thresh) / max(force_full - force_thresh, 1e-6), 0.0, 1.0))
+    v_gain = float(np.clip((v - vel_thresh)   / max(vel_full   - vel_thresh,   1e-6), 0.0, 1.0))
+    gate   = f_gain * v_gain
+    return (np.asarray(signal, dtype=np.float32) * gate).astype(np.float32)
+
+
+def apply_common_output_limit(signal, roughness, velocity=0.05):
     x = np.asarray(signal, dtype=np.float32).copy()
     x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     x = x - np.mean(x)
     x = hard_clip_by_median(x, ratio=4.5)
 
     cur_rms = rms(x)
-    target = roughness_to_target_rms(roughness)
+    target = roughness_to_target_rms(roughness, velocity=velocity)
     raw_scale = target / (cur_rms + 1e-8)
-    scale = 0.80 + 0.20 * raw_scale
-    scale = float(np.clip(scale, 0.88, 1.15))
+    scale = float(np.clip(raw_scale, 0.20, 3.0))
     return (x * scale).astype(np.float32)
 
-def enhance_acc_by_roughness(
-    acc,
-    roughness,
-    rng=None,
-    smooth_w=7,
-):
+
+def enhance_acc_by_roughness(acc, roughness, rng=None, smooth_w=5):
     """
-    roughness 높을수록:
-      - 저주파 패턴(긁는 느낌)의 진폭을 키움
-      - 고주파 노이즈는 최소화
+    Data-driven spectral shaping based on measured reference signals.
+
+    Measured pattern (metrics_reference.csv):
+      smooth (R=5):   centroid≈126 Hz, HF_ratio=0.040  →  buzzy / HF-dominant
+      mid    (R=23):  centroid≈134 Hz, HF_ratio=0.052  →  most HF
+      rough  (R=100): centroid≈111 Hz, HF_ratio=0.027  →  thuddy / LF-dominant
+
+    Strategy:
+      LF gain  ∝  roughness   (rough → bigger slow oscillation)
+      HF gain  ∝  1-roughness (smooth → more fine buzz)
+      Noise texture: smooth→fine HF noise, rough→coarser LF noise
     """
     if rng is None:
         rng = np.random.default_rng()
     x = to_1d_float32(acc).copy()
     r = np.clip(float(roughness) / 100.0, 0.0, 1.0)
-    # 저주파(긁는 패턴)와 고주파 분리
-    slow = moving_average(x, smooth_w)   # 저주파 = 긁는 패턴
-    high = x - slow                      # 고주파 = 노이즈
-    # roughness 높을수록 저주파 진폭↑, 고주파는 그대로 유지
-    amp_gain = 1.0 + 1.5 * r             # r=0 → 1.0x, r=1 → 2.5x
-    x = slow * amp_gain + high           # 저주파만 키움
-    # 노이즈는 아주 약하게만
-    noise_sigma = 0.002 + 0.005 * r      # 기존 0.003~0.035 → 훨씬 작게
-    x = x + rng.normal(0.0, noise_sigma, size=x.shape).astype(np.float32)
+
+    # ── LF / HF split ─────────────────────────────────────────────────────────
+    # smooth_w=5 at 8000 Hz → LPF cutoff ~500 Hz
+    slow = moving_average(x, smooth_w)   # LF ≤ ~500 Hz
+    fast = x - slow                      # HF > ~500 Hz
+
+    # ── spectral gains (calibrated to measured data) ──────────────────────────
+    # r=0 (smooth): lf_gain=0.80, hf_gain=1.40  →  buzzy texture
+    # r=1 (rough):  lf_gain=1.40, hf_gain=0.70  →  thuddy texture
+    lf_gain = 0.50 + 1.50 * r            # 0.50 → 2.00  (rough → strong thud)
+    hf_gain = 2.00 - 1.50 * r            # 2.00 → 0.50  (smooth → strong buzz)
+
+    x = slow * lf_gain + fast * hf_gain
+
+    # ── roughness-textured noise ───────────────────────────────────────────────
+    # smooth → fine HF noise;  rough → coarser LF noise
+    noise_raw = rng.normal(0.0, 1.0, size=x.shape).astype(np.float32)
+    noise_w   = max(1, int(1 + 9 * r))   # r=0 → w=1 (HF noise), r=1 → w=10 (LF noise)
+    noise_lf  = moving_average(noise_raw, noise_w)
+    noise_hf  = noise_raw - noise_lf
+
+    sigma_lf = 0.008 * r                 # rough surface: LF noise component
+    sigma_hf = 0.008 * (1.0 - r)         # smooth surface: HF noise component
+    x = x + noise_lf * sigma_lf + noise_hf * sigma_hf
+
     x = hard_clip_by_median(x, ratio=5.0)
     return x.astype(np.float32)
 
@@ -230,7 +276,33 @@ class LiteSeq2SeqCNNGRU_AttnPool(nn.Module):
         return self.head(ctx)                     # [B, 40]
 
 
-def load_model_from_pt(pt_path, device="cpu", in_ch=3, output_steps=40):
+# =========================================================
+# ONNX Runtime wrapper (drop-in replacement for PyTorch model)
+# =========================================================
+class _ONNXModel:
+    """onnxruntime-based inference wrapper — same call signature as nn.Module."""
+    def __init__(self, onnx_path: str):
+        import onnxruntime as ort
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 1   # single-threaded fastest for small models
+        opts.inter_op_num_threads = 1
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        self._sess = ort.InferenceSession(
+            str(onnx_path), sess_options=opts,
+            providers=["CPUExecutionProvider"],
+        )
+        self._inp = self._sess.get_inputs()[0].name
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        out = self._sess.run(None, {self._inp: x.cpu().numpy()})[0]
+        return torch.from_numpy(out)
+
+    def eval(self):   return self
+    def to(self, *a, **kw): return self
+
+
+def load_model_from_pt(pt_path, device="cpu", in_ch=3, output_steps=40,
+                       onnx_path=None, use_compile=False):
     pt_path = Path(pt_path)
     if not pt_path.exists():
         raise FileNotFoundError(f"PT file not found: {pt_path}")
@@ -243,10 +315,38 @@ def load_model_from_pt(pt_path, device="cpu", in_ch=3, output_steps=40):
     model = LiteSeq2SeqCNNGRU_AttnPool(in_ch=in_ch, output_steps=output_steps).to(device)
 
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-        model.load_state_dict(ckpt["model_state_dict"], strict=True)
+        state = ckpt["model_state_dict"]
     else:
-        model.load_state_dict(ckpt, strict=True)
+        state = ckpt
+    # filter out training-only keys (e.g. roughness_head) not present in inference model
+    model_keys = set(model.state_dict().keys())
+    filtered   = {k: v for k, v in state.items() if k in model_keys}
+    missing    = model_keys - set(filtered.keys())
+    if missing:
+        print(f"[WARN] missing keys in checkpoint: {missing}")
+    model.load_state_dict(filtered, strict=True)
     model.eval()
+
+    # ONNX: auto-export if onnx_path given but file doesn't exist yet
+    if onnx_path is not None:
+        onnx_path = Path(onnx_path)
+        if not onnx_path.exists():
+            print(f"[ONNX] Exporting to {onnx_path} ...")
+            dummy = torch.randn(1, 4, 400)
+            torch.onnx.export(
+                model, dummy, str(onnx_path),
+                input_names=["input"], output_names=["output"],
+                opset_version=17,
+            )
+            print(f"[ONNX] Saved ({onnx_path.stat().st_size//1024} KB)")
+        model = _ONNXModel(str(onnx_path))
+        print(f"[ONNX] Loaded {onnx_path}")
+    elif use_compile:
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            print("[COMPILE] torch.compile applied")
+        except Exception as e:
+            print(f"[COMPILE] torch.compile failed ({e}), using eager mode")
 
     if not isinstance(ckpt, dict):
         raise ValueError("pt 파일이 dict가 아니라서 x_mean/x_std/y_mean/y_std를 읽을 수 없습니다.")
@@ -632,19 +732,209 @@ class RealtimeReferenceGuidedGenerator:
         return np.asarray(out_final, dtype=np.float32), None
 
 # =========================================================
+# 5) Live plot mode
+# =========================================================
+def run_live_plot(args):
+    """
+    --live-plot 모드: 슬라이더로 roughness/force/velocity를 실시간 조절하면서
+    모델 가속도 출력을 rolling window로 시각화.
+
+    실행 예:
+      python -m scripts.realtime --live-plot \\
+          --pt-path pt_files/runs/20260612-003/best_model.pt \\
+          --cache-path pt_files/inference_cache_allinone.npz
+    """
+    import matplotlib
+    matplotlib.use("TkAgg")
+    import matplotlib.pyplot as plt
+    import matplotlib.animation as animation
+    from matplotlib.widgets import Slider
+
+    device  = "cpu"
+    win_samp = int(args.plot_window)
+    SR       = 8000
+
+    # ── 공유 상태 (슬라이더 콜백에서 갱신) ──────────────────────────────────
+    state = {
+        "roughness": float(args.roughness_val),
+        "force":     float(args.force_val),
+        "vel":       float(args.vel_val),
+        "reload":    False,   # roughness 변경 시 guide 재로드 필요
+    }
+
+    print("[LIVE] loading cache …")
+    cache = InferenceCache(args.cache_path)
+    model, x_mean, x_std, y_mean, y_std = load_model_from_pt(
+        args.pt_path, device=device, in_ch=3,
+        output_steps=args.output_steps,
+    )
+
+    def _make_generator(roughness):
+        guide, info = cache.build_reference_guide(
+            roughness=roughness,
+            seg_target_len=args.seg_target_len,
+            seg_idx=args.seg_idx,
+            max_abs_peak=args.max_abs_peak,
+        )
+        print(f"[LIVE] guide rebuilt  R={roughness:.0f}  mode={info.get('guide_mode')}")
+        return RealtimeReferenceGuidedGenerator(
+            model=model, x_mean=x_mean, x_std=x_std,
+            y_mean=y_mean, y_std=y_std,
+            roughness=roughness, guide_acc=guide["acc"],
+            device=device, input_steps=args.input_steps,
+            output_steps=args.output_steps,
+            ref_blend=args.ref_blend, mode=args.mode,
+        )
+
+    rt_holder = [_make_generator(state["roughness"])]
+
+    # ── 레이아웃: 위=파형+RMS, 아래=슬라이더 3개 ─────────────────────────────
+    fig = plt.figure(figsize=(13, 7.5))
+    fig.patch.set_facecolor("#1e1e2e")
+
+    ax_acc = fig.add_axes([0.07, 0.45, 0.88, 0.46])   # 파형
+    ax_rms = fig.add_axes([0.07, 0.28, 0.88, 0.12])   # RMS history
+
+    ax_sl_r = fig.add_axes([0.15, 0.17, 0.72, 0.03])  # roughness 슬라이더
+    ax_sl_f = fig.add_axes([0.15, 0.11, 0.72, 0.03])  # force 슬라이더
+    ax_sl_v = fig.add_axes([0.15, 0.05, 0.72, 0.03])  # velocity 슬라이더
+
+    for ax in (ax_acc, ax_rms):
+        ax.set_facecolor("#1e1e2e")
+        ax.tick_params(colors="white", labelsize=8)
+        for sp in ax.spines.values():
+            sp.set_edgecolor("#555577")
+
+    # ── 파형 플롯 ────────────────────────────────────────────────────────────
+    acc_buf = deque([0.0] * win_samp, maxlen=win_samp)
+    t_ms    = np.arange(win_samp) / SR * 1000.0
+    (line_acc,) = ax_acc.plot(t_ms, list(acc_buf), lw=0.6, color="#ff9d3a", alpha=0.9)
+    ax_acc.set_ylim(-2.0, 2.0)
+    ax_acc.set_xlim(0, t_ms[-1])
+    ax_acc.axhline(0, lw=0.4, color="#888899", ls="--")
+    ax_acc.set_ylabel("Acceleration (m/s²)", color="white", fontsize=9)
+    ax_acc.set_xlabel("ms", color="white", fontsize=8)
+    ax_acc.grid(True, lw=0.3, alpha=0.35, color="#444466")
+    title_txt = ax_acc.set_title("", color="white", fontsize=10)
+
+    # ── RMS 이력 ─────────────────────────────────────────────────────────────
+    rms_hist_len = 200
+    rms_history  = deque([0.0] * rms_hist_len, maxlen=rms_hist_len)
+    (line_rms,)  = ax_rms.plot(np.arange(rms_hist_len), list(rms_history),
+                               lw=1.0, color="#66ccff")
+    ax_rms.set_ylim(0, 1.5)
+    ax_rms.set_xlim(0, rms_hist_len)
+    ax_rms.set_ylabel("RMS", color="white", fontsize=8)
+    ax_rms.grid(True, lw=0.3, alpha=0.35, color="#444466")
+    tgt_line = ax_rms.axhline(
+        roughness_to_target_rms(state["roughness"], velocity=state["vel"]),
+        lw=1.2, color="#ff6666", ls="--", alpha=0.85, label="target RMS"
+    )
+    ax_rms.legend(fontsize=7, facecolor="#2a2a3e", labelcolor="white",
+                  edgecolor="#555577")
+
+    # ── 슬라이더 ─────────────────────────────────────────────────────────────
+    sl_style = dict(color="#3a3a5c", track_color="#555577")
+    sl_r = Slider(ax_sl_r, "Roughness", 0.0,  100.0, valinit=state["roughness"],
+                  valstep=1.0,  **sl_style)
+    sl_f = Slider(ax_sl_f, "Force (N)", 0.0,  10.0,  valinit=state["force"],
+                  valstep=0.1,  **sl_style)
+    sl_v = Slider(ax_sl_v, "Vel (m/s)", 0.0,  0.25,  valinit=state["vel"],
+                  valstep=0.005, **sl_style)
+    for sl in (sl_r, sl_f, sl_v):
+        sl.label.set_color("white")
+        sl.valtext.set_color("#ffcc88")
+
+    ROUGHNESS_RELOAD_THRESH = 2.0
+
+    def on_roughness(val):
+        new_r = float(val)
+        if abs(new_r - state["roughness"]) >= ROUGHNESS_RELOAD_THRESH:
+            state["reload"] = True
+        state["roughness"] = new_r
+
+    def on_force(val):
+        state["force"] = float(val)
+
+    def on_vel(val):
+        state["vel"] = float(val)
+
+    sl_r.on_changed(on_roughness)
+    sl_f.on_changed(on_force)
+    sl_v.on_changed(on_vel)
+
+    # ── 애니메이션 업데이트 ───────────────────────────────────────────────────
+    def update(_frame):
+        r = state["roughness"]
+        f = state["force"]
+        v = state["vel"]
+
+        if state["reload"]:
+            state["reload"] = False
+            rt_holder[0] = _make_generator(r)
+            acc_buf.clear()
+            acc_buf.extend([0.0] * win_samp)
+            rms_history.clear()
+            rms_history.extend([0.0] * rms_hist_len)
+        else:
+            rt_holder[0].update_roughness(r)
+
+        force_arr = np.full(args.output_steps, f, dtype=np.float32)
+        vel_arr   = np.full(args.output_steps, v, dtype=np.float32)
+        acc, _    = rt_holder[0].predict(force_arr, vel_arr, num_samples=args.output_steps)
+
+        if not args.no_enhance_roughness:
+            acc = enhance_acc_by_roughness(acc, r, rng=rng)
+        if not args.no_output_limit:
+            acc = apply_common_output_limit(acc, r, velocity=v)
+        acc = force_velocity_gate(acc, f, v)
+
+        acc_buf.extend(acc.tolist())
+        data    = np.asarray(acc_buf, dtype=np.float32)
+        cur_rms = float(np.sqrt(np.mean(data ** 2)))
+        tgt     = roughness_to_target_rms(r, velocity=v)
+
+        line_acc.set_ydata(data)
+        rms_history.append(cur_rms)
+        line_rms.set_ydata(list(rms_history))
+        tgt_line.set_ydata([tgt, tgt])
+
+        title_txt.set_text(
+            f"Live Gen  |  R={r:.0f}  F={f:.2f} N  V={v:.4f} m/s  "
+            f"RMS={cur_rms:.3f}  target={tgt:.3f}  mode={args.mode}"
+        )
+        return line_acc, line_rms, tgt_line, title_txt
+
+    ani = animation.FuncAnimation(   # noqa: F841
+        fig, update, interval=args.plot_interval,
+        blit=False, cache_frame_data=False,
+    )
+    print("[LIVE] window open — 슬라이더로 R/F/V 조절, 창 닫으면 종료")
+    plt.show()
+
+
+# =========================================================
 # 6) Offline & Socket server
 # =========================================================
 
 def run_offline_generation(args):
     device = "cuda" if (args.device == "cuda" and torch.cuda.is_available()) else "cpu"
     print(f"[OFFLINE] Starting generation for 100 iterations (4000 samples) on {device}...")
-    
+
     cache = InferenceCache(args.cache_path)
+    pt_path = args.pt_path
+    onnx_path = getattr(args, "onnx_path", None)
+    if onnx_path is not None and pt_path == "pt_files/best_model_light.pt":
+        candidate = Path(onnx_path).parent / "best_model.pt"
+        if candidate.exists():
+            pt_path = str(candidate)
     model, x_mean, x_std, y_mean, y_std = load_model_from_pt(
-        args.pt_path,
+        pt_path,
         device=device,
         in_ch=3,
         output_steps=args.output_steps,
+        onnx_path=onnx_path,
+        use_compile=getattr(args, "use_compile", False),
     )
 
     test_roughness = 66.0
@@ -689,7 +979,7 @@ def run_offline_generation(args):
         if not args.no_enhance_roughness:
             processed_acc = enhance_acc_by_roughness(processed_acc, roughness=test_roughness, rng=rng)
         if args.apply_output_limit:
-            processed_acc = apply_common_output_limit(processed_acc, roughness=test_roughness)
+            processed_acc = apply_common_output_limit(processed_acc, roughness=test_roughness, velocity=test_speed)
 
         wave_data = acc_to_uint16_wave(
             processed_acc,
@@ -733,7 +1023,23 @@ def start_socket_server(args):
 
     device = "cuda" if (args.device == "cuda" and torch.cuda.is_available()) else "cpu"
     cache = InferenceCache(args.cache_path)
-    model, x_mean, x_std, y_mean, y_std = load_model_from_pt(args.pt_path, device=device, in_ch=3, output_steps=args.output_steps)
+
+    # --onnx-path 지정 시 같은 디렉토리의 best_model.pt를 pt_path로 자동 추론
+    pt_path = args.pt_path
+    onnx_path = getattr(args, "onnx_path", None)
+    if onnx_path is not None and pt_path == "pt_files/best_model_light.pt":
+        candidate = Path(onnx_path).parent / "best_model.pt"
+        if candidate.exists():
+            pt_path = str(candidate)
+            print(f"[ONNX] auto-inferred pt_path: {pt_path}")
+        else:
+            print(f"[WARN] pt_path not found: {candidate}. ONNX export will fail if .onnx doesn't exist.")
+
+    model, x_mean, x_std, y_mean, y_std = load_model_from_pt(
+        pt_path, device=device, in_ch=3, output_steps=args.output_steps,
+        onnx_path=onnx_path,
+        use_compile=getattr(args, "use_compile", False),
+    )
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -750,6 +1056,7 @@ def start_socket_server(args):
             current_roughness = None
             try:
                 while True:
+                    t_start = time.perf_counter()
                     data = recv_exact(client_socket, 28)
                     if data is None: break
                     roughness, force_mag, vx, vy, vz, user_id, fingerIdx = struct.unpack("<7f", data)
@@ -764,11 +1071,18 @@ def start_socket_server(args):
                     else:
                         rt.update_roughness(roughness)
 
+                    t_pred = time.perf_counter()
                     acc, _ = rt.predict(np.full(num_samples, force_mag), np.full(num_samples, speed), num_samples=num_samples)
+                    t_pred_end = time.perf_counter()
+
                     if not args.no_enhance_roughness: acc = enhance_acc_by_roughness(acc, roughness, rng=rng)
-                    if args.apply_output_limit: acc = apply_common_output_limit(acc, roughness)
+                    if not args.no_output_limit: acc = apply_common_output_limit(acc, roughness, velocity=speed)
+                    acc = force_velocity_gate(acc, force_mag, speed)
                     wave_data = acc_to_uint16_wave(acc, device_num=int(user_id)%2, channel_num=int(fingerIdx))
                     client_socket.sendall(struct.pack(f"<{num_samples}H", *wave_data))
+
+                    t_end = time.perf_counter()
+                    print(f"[TIME] samples={num_samples} | predict={( t_pred_end - t_pred)*1000:.2f}ms | total={( t_end - t_start)*1000:.2f}ms | budget={(num_samples/8000)*1000:.2f}ms")
             except Exception as e: print(f"[ERROR] {e}")
             finally: client_socket.close()
     finally: server_socket.close()
@@ -781,7 +1095,7 @@ def build_argparser():
     p.add_argument("--host", type=str, default="127.0.0.1")
     p.add_argument("--port", type=int, default=65432)
     p.add_argument("--mode", type=str, default="safe")
-    p.add_argument("--ref-blend", type=float, default=0.20)
+    p.add_argument("--ref-blend", type=float, default=0.50)
     p.add_argument("--input-steps", type=int, default=400)
     p.add_argument("--output-steps", type=int, default=40)
     p.add_argument("--seg-target-len", type=int, default=4000)
@@ -789,9 +1103,31 @@ def build_argparser():
     p.add_argument("--max-abs-peak", type=float, default=4.0)
     p.add_argument("--roughness-change-threshold", type=float, default=0.25)
     p.add_argument("--no-enhance-roughness", action="store_true")
-    p.add_argument("--apply-output-limit", action="store_true")
+    p.add_argument("--no-output-limit", action="store_true")
     p.add_argument("--save-test-signal", action="store_true")
+    p.add_argument("--onnx-path", type=str, default=None,
+                   help="ONNX 파일 경로. 지정하면 ONNX Runtime으로 추론 (3-5x 빠름). "
+                        "파일이 없으면 자동 export. 예: pt_files/runs/20260610-004/best_model.onnx")
+    p.add_argument("--use-compile", action="store_true",
+                   help="torch.compile 적용 (PyTorch 2.0+, 약 1.5-2x 빠름)")
+    # ── live plot ─────────────────────────────────────────────────────────────
+    p.add_argument("--live-plot", action="store_true",
+                   help="실시간 가속도 플롯 모드. 소켓 서버 없이 단독 실행.")
+    p.add_argument("--roughness-val", type=float, default=58.0,
+                   help="[live-plot] 거칠기 값 (0~100, default: 58)")
+    p.add_argument("--force-val", type=float, default=1.96,
+                   help="[live-plot] 힘 (N, default: 1.96)")
+    p.add_argument("--vel-val", type=float, default=0.067,
+                   help="[live-plot] 속도 (m/s, default: 0.067)")
+    p.add_argument("--plot-window", type=int, default=8000,
+                   help="[live-plot] 화면에 표시할 샘플 수 (default: 8000 = 1s)")
+    p.add_argument("--plot-interval", type=int, default=20,
+                   help="[live-plot] 애니메이션 갱신 주기 ms (default: 20)")
     return p
 
 if __name__ == "__main__":
-    start_socket_server(build_argparser().parse_args())
+    _args = build_argparser().parse_args()
+    if _args.live_plot:
+        run_live_plot(_args)
+    else:
+        start_socket_server(_args)
