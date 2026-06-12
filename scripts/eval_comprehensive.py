@@ -25,6 +25,8 @@ import torch
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from scipy import signal as scipy_signal
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -261,6 +263,94 @@ def plot_ramp_grid(ramp_data, row_labels, title, out_path,
     print(f"  saved: {out_path.name}")
 
 
+# --- ramp grid with spectrogram ---
+
+def plot_ramp_with_spectrogram(ramp_data, row_labels, title, out_path,
+                                acc_ylim, force_max, vel_max):
+    """
+    ramp_data[r] = (signal, f_per_sample, v_per_sample)
+    4 columns: Acceleration+Spectrogram | Force (N) | Velocity (m/s)
+    Each row has 2 sub-rows: waveform (top) + spectrogram (bottom).
+    """
+    nrows   = len(row_labels)
+    t_ms    = np.arange(N_SAMPLES) / SAMPLE_RATE * 1000.0
+    col_w   = [3.0, 1.4, 1.4]   # acc+spec wider, force/vel narrower
+
+    fig = plt.figure(figsize=(sum(col_w) * 1.6, nrows * 3.2))
+    fig.suptitle(title, fontsize=10, y=1.002)
+
+    outer = gridspec.GridSpec(nrows, 3, figure=fig,
+                              width_ratios=col_w,
+                              hspace=0.55, wspace=0.28)
+
+    for r, rlabel in enumerate(row_labels):
+        sig, f_arr, v_arr = ramp_data[r]
+        rms_val = float(np.sqrt(np.mean(sig ** 2)))
+
+        # ── col 0: waveform + spectrogram ────────────────────────────────────
+        inner = gridspec.GridSpecFromSubplotSpec(
+            2, 1, subplot_spec=outer[r, 0],
+            height_ratios=[1, 1.3], hspace=0.06)
+
+        ax_w = fig.add_subplot(inner[0])
+        ax_s = fig.add_subplot(inner[1])
+
+        ax_w.plot(t_ms, sig, lw=0.4, color="steelblue", rasterized=True)
+        ax_w.set_ylim(*acc_ylim)
+        ax_w.set_ylabel(f"R={rlabel}\nm/s²", fontsize=7, fontweight="bold")
+        ax_w.text(0.02, 0.95, f"RMS={rms_val:.3f}",
+                  transform=ax_w.transAxes, fontsize=6.5, va="top", color="crimson")
+        ax_w.tick_params(labelsize=5.5, labelbottom=False)
+        ax_w.grid(True, lw=0.2, alpha=0.3)
+        if r == 0:
+            ax_w.set_title("Acceleration (m/s²)", fontsize=8)
+
+        f_spec, t_spec, Sxx = scipy_signal.spectrogram(
+            sig, fs=SAMPLE_RATE, nperseg=256, noverlap=224,
+            window="hann", scaling="density")
+        freq_mask = f_spec <= 800
+        Sxx_db = 10 * np.log10(Sxx[freq_mask] + 1e-12)
+        ax_s.pcolormesh(t_spec * 1000., f_spec[freq_mask], Sxx_db,
+                        shading="gouraud", cmap="inferno",
+                        vmin=np.percentile(Sxx_db, 15),
+                        vmax=np.percentile(Sxx_db, 99))
+        ax_s.set_ylabel("Hz", fontsize=6)
+        ax_s.tick_params(labelsize=5.5)
+        if r == nrows - 1:
+            ax_s.set_xlabel("Time (ms)", fontsize=7)
+        if r == 0:
+            ax_s.annotate("Spectrogram (0–800 Hz)", xy=(0.5, -0.3),
+                          xycoords="axes fraction", ha="center", fontsize=6)
+
+        # ── col 1: force ─────────────────────────────────────────────────────
+        ax_f = fig.add_subplot(outer[r, 1])
+        ax_f.plot(t_ms, f_arr, lw=0.9, color="crimson")
+        ax_f.set_ylim(-0.05, force_max * 1.15)
+        ax_f.set_ylabel("N", fontsize=6)
+        ax_f.tick_params(labelsize=5.5)
+        ax_f.grid(True, lw=0.2, alpha=0.3)
+        if r == 0:
+            ax_f.set_title("Force (N)", fontsize=8)
+        if r == nrows - 1:
+            ax_f.set_xlabel("Time (ms)", fontsize=7)
+
+        # ── col 2: velocity ───────────────────────────────────────────────────
+        ax_v = fig.add_subplot(outer[r, 2])
+        ax_v.plot(t_ms, v_arr, lw=0.9, color="seagreen")
+        ax_v.set_ylim(-0.001, vel_max * 1.15)
+        ax_v.set_ylabel("m/s", fontsize=6)
+        ax_v.tick_params(labelsize=5.5)
+        ax_v.grid(True, lw=0.2, alpha=0.3)
+        if r == 0:
+            ax_v.set_title("Velocity (m/s)", fontsize=8)
+        if r == nrows - 1:
+            ax_v.set_xlabel("Time (ms)", fontsize=7)
+
+    fig.savefig(out_path, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved: {out_path.name}")
+
+
 # --- summary heatmap ---
 
 def plot_summary(all_rms, conditions, roughness_list, out_path):
@@ -479,14 +569,14 @@ def main():
         save_dir / "vel_sweep_grid.png",
         acc_ylim, force_max, vel_max,
     )
-    plot_ramp_grid(
+    plot_ramp_with_spectrogram(
         framp_list,
         [str(r) for r in roughness_list],
         f"Force ramp  0 -> {force_max:.1f} N  (vel={mid_vel:.3f} fixed)  [{run_dir.name}]",
         save_dir / "force_ramp_grid.png",
         acc_ylim, force_max, vel_max,
     )
-    plot_ramp_grid(
+    plot_ramp_with_spectrogram(
         vramp_list,
         [str(r) for r in roughness_list],
         f"Velocity ramp  0 -> {vel_max:.3f} m/s  (force={mid_force:.2f} fixed)  [{run_dir.name}]",

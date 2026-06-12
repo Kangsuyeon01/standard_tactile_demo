@@ -3,25 +3,45 @@
 CNN + GRU + FiLM 기반 표면 거칠기 진동 생성 모델.  
 입력(가속도 히스토리, 힘, 속도, 거칠기)에서 미래 가속도 신호를 예측한다.
 
+---
+
+> **⚡ 실시간 추론 최적화 (권장)**
+>
+> `realtime.py`는 **ONNX Runtime** 으로 구동하면 PyTorch 대비 빠른 추론이 가능합니다.  
+>
+> ```bash
+> pip install onnx onnxruntime
+> ```
+>
+> ONNX 모델은 첫 실행 시 자동 export되며, 이후 자동으로 사용됩니다.  
+> 수동 export:
+> ```bash
+> python -m scripts.realtime \
+>     --pt-path pt_files/runs/<run_id>/best_model.pt \
+>     --cache-path pt_files/inference_cache_allinone.npz \
+>     --onnx-path pt_files/runs/<run_id>/best_model.onnx
+> ```
+
+---
+
 ## 프로젝트 구조
 
 ```
 roughness_model/
 ├── scripts/
-│   ├── preprocess.py            # 1단계: CSV → NPZ 캐시 생성
-│   ├── resplit_npz.py           # 기존 NPZ를 참가자 기반으로 재분할 (전처리 재실행 불필요)
-│   ├── train.py                 # 2단계: 모델 학습 (run ID 리포트 포함, 학습 후 자동 평가)
-│   ├── evaluate.py              # RMSE/MAE/Corr, 특성 중요도, Saliency
-│   ├── eval_test_samples.py          # 전체 데이터 기반 실제 vs 예측 신호 비교 (학습 후 자동 실행)
-│   ├── eval_test_samples_blended.py  # 동일 레이아웃, realtime.py와 동일한 reference 블렌딩 적용
-│   ├── eval_comprehensive.py    # roughness × 조건/force/velocity 그리드 평가
-│   ├── eval_roughness_signal.py # 고정 F/V에서 roughness만 변화시킨 신호 비교
-│   ├── eval_fv_sweep.py         # force/velocity sweep → RMS 히트맵
-│   ├── benchmark_inference.py   # PyTorch vs ONNX Runtime 추론 속도 비교
+│   ├── preprocess.py               # 1단계: CSV → NPZ 캐시 생성
+│   ├── resplit_npz.py              # 기존 NPZ를 참가자 기반으로 재분할
+│   ├── train.py                    # 2단계: 모델 학습 (학습 후 자동 평가 4종 실행)
+│   ├── eval_test_samples.py        # [auto] 실제 vs 예측 신호 비교
+│   ├── eval_comprehensive.py       # [auto] roughness × 조건/force/velocity 그리드 평가 + spectrogram
+│   ├── eval_roughness_signal.py    # [auto] 고정 F/V에서 roughness별 신호 비교
+│   ├── gen_ramp_plots.py           # [auto] force/velocity ramp 시나리오 시각화 (spectrogram 포함)
+│   ├── gen_sweep_plot.py           # roughness × force × velocity 스윕 플롯
 │   ├── analyze_fv_distribution.py  # 학습 데이터 Force/Velocity 분포 박스플롯
-│   ├── demo.py                  # 대화형 진동 출력 루프 (NI-DAQ)
-│   ├── plot_analysis.py         # LOW/MID/HIGH + 생성 신호 비교 플롯
-│   └── realtime.py              # Unity 소켓 서버 + 라이브 플롯 모드
+│   ├── analyze_velocity_spectrum.py # 속도 구간별 주파수 스펙트럼 분석
+│   ├── benchmark_inference.py      # PyTorch vs ONNX Runtime 추론 속도 비교
+│   ├── demo.py                     # 대화형 진동 출력 루프 (NI-DAQ)
+│   └── realtime.py                 # Unity 소켓 서버 + 라이브 플롯 모드 (ONNX 지원)
 ├── pt_files/
 │   ├── inference_cache_allinone.npz    # 전처리 캐시 (roughness label 기반 split)
 │   ├── inference_cache_participant.npz # 참가자 기반 재분할 캐시
@@ -348,23 +368,19 @@ Python → Unity : uint16 파형 샘플 (little endian), IIR 필터 적용
 python -m scripts.realtime
 
 # ONNX Runtime으로 실행 (권장 — 23x 빠름, 0.25ms/추론)
-python -m scripts.realtime \
-  --pt-path pt_files/runs/20260610-004/best_model.pt \
-  --onnx-path pt_files/runs/20260610-004/best_model.onnx
+python -m scripts.realtime --pt-path pt_files/runs/20260612-003/best_model.pt --onnx-path pt_files/runs/20260612-003/best_model.onnx
 
 # GPU 사용
 python -m scripts.realtime --device cuda
 
 # 특정 run 모델 사용
-python -m scripts.realtime --pt-path pt_files/runs/20260610-001/best_model.pt
+python -m scripts.realtime --pt-path pt_files/runs/20260612-003/best_model.pt
 
 # 오프라인 신호 생성 테스트 (Unity 불필요)
 python -m scripts.realtime --save-test-signal
 
 # 라이브 플롯 모드 (슬라이더로 R/F/V 실시간 조절)
-python -m scripts.realtime --live-plot \
-  --pt-path pt_files/runs/20260612-003/best_model.pt \
-  --cache-path pt_files/inference_cache_allinone.npz
+python -m scripts.realtime --live-plot --pt-path pt_files/runs/20260612-003/best_model.pt --cache-path pt_files/inference_cache_allinone.npz
 ```
 
 ### 라이브 플롯 모드 (`--live-plot`)

@@ -765,6 +765,31 @@ def main(args):
         if r3.returncode != 0:
             print("[AUTO EVAL 3/3] failed (exit code", r3.returncode, ")")
 
+        print("\n[AUTO EVAL 4/4] gen_ramp_plots.py ...")
+        # ONNX export (없으면 자동 생성)
+        if not _onnx.exists():
+            print("[AUTO EVAL 4/4] exporting ONNX ...")
+            subprocess.run(
+                [_sys.executable, "-m", "scripts.realtime",
+                 "--pt-path", str(run_dir / "best_model.pt"),
+                 "--cache-path", str(_allinone_npz),
+                 "--onnx-path", str(_onnx)],
+                cwd=cwd,
+            )
+        _onnx = run_dir / "best_model.onnx"
+        if _onnx.exists() and _allinone_npz.exists():
+            r4 = subprocess.run(
+                [_sys.executable, "-m", "scripts.gen_ramp_plots",
+                 "--pt-path", str(run_dir / "best_model.pt"),
+                 "--cache-path", str(_allinone_npz),
+                 "--out-dir", str(run_dir)],
+                cwd=cwd,
+            )
+            if r4.returncode != 0:
+                print("[AUTO EVAL 4/4] failed (exit code", r4.returncode, ")")
+        else:
+            print("[AUTO EVAL 4/4] skipped (ONNX or cache not found)")
+
 
 # --- Argparse ---
 
