@@ -16,10 +16,7 @@ CNN + GRU + FiLM 기반 표면 거칠기 진동 생성 모델.
 > ONNX 모델은 첫 실행 시 자동 export되며, 이후 자동으로 사용됩니다.  
 > 수동 export:
 > ```bash
-> python -m scripts.realtime \
->     --pt-path pt_files/runs/<run_id>/best_model.pt \
->     --cache-path pt_files/inference_cache_allinone.npz \
->     --onnx-path pt_files/runs/<run_id>/best_model.onnx
+> python -m scripts.realtime --pt-path pt_files/runs/<run_id>/best_model.pt --cache-path pt_files/inference_cache_allinone.npz --onnx-path pt_files/runs/<run_id>/best_model.onnx
 > ```
 
 ---
