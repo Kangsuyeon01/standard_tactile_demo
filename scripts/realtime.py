@@ -764,8 +764,18 @@ def run_live_plot(args):
 
     print("[LIVE] loading cache …")
     cache = InferenceCache(args.cache_path)
+
+    # --onnx-path만 지정된 경우 같은 디렉토리의 best_model.pt를 자동 추론
+    pt_path = args.pt_path
+    onnx_path = getattr(args, "onnx_path", None)
+    if onnx_path is not None and pt_path == "pt_files/best_model_light.pt":
+        candidate = Path(onnx_path).parent / "best_model.pt"
+        if candidate.exists():
+            pt_path = str(candidate)
+            print(f"[LIVE] auto-inferred pt_path: {pt_path}")
+
     model, x_mean, x_std, y_mean, y_std = load_model_from_pt(
-        args.pt_path, device=device, in_ch=3,
+        pt_path, device=device, in_ch=3,
         output_steps=args.output_steps,
     )
 
