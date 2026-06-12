@@ -539,6 +539,26 @@ def main(args):
         print(f"[TRANSITION AUG] {n_trans} transition samples added "
               f"({args.transition_augment_ratio*100:.0f}% of real train) -> total {len(X_train)}")
 
+    # --- Hard-gate augmentation ---
+    # real acc 히스토리 + force=0, vel=0 → Y=0
+    # transition aug만으로는 force=0 샘플 비중이 낮아서 별도 추가.
+    if args.hard_gate_augment_ratio > 0:
+        n_hard = int(n_real * args.hard_gate_augment_ratio)
+        rng_hard = np.random.default_rng(44)
+
+        idx = rng_hard.integers(0, n_real, size=n_hard)
+        X_hard = X_train[idx].copy()
+        Y_hard = np.zeros((n_hard, Y_train.shape[1]), dtype=np.float32)
+
+        X_hard[:, 1, :] = 0.0  # force=0
+        X_hard[:, 2, :] = 0.0  # velocity=0
+        # acc 채널(ch0)은 real 신호 그대로 유지 → "acc 있어도 force=0이면 출력=0" 학습
+
+        X_train = np.concatenate([X_train, X_hard], axis=0)
+        Y_train = np.concatenate([Y_train, Y_hard], axis=0)
+        print(f"[HARD GATE AUG] {n_hard} hard-gate samples added "
+              f"({args.hard_gate_augment_ratio*100:.0f}% of real train) -> total {len(X_train)})")
+
     print("[DATA SHAPES]")
     for name, arr in [("X_train", X_train), ("X_val", X_val), ("X_test", X_test)]:
         print(f"  {name}: {arr.shape}")
@@ -878,13 +898,15 @@ def build_args():
                    help="Spectral profile loss: match roughness-specific FFT shape from training data")
     p.add_argument("--lambda-rough-cls", type=float, default=1.0,
                    help="Roughness cls loss on hidden ctx (train-only, zero inference overhead)")
-    p.add_argument("--lambda-vel-gate", type=float, default=2.0,
+    p.add_argument("--hard-gate-augment-ratio", type=float, default=0.10,
+                   help="real acc + force=0, vel=0 → Y=0 샘플 추가 비율")
+    p.add_argument("--lambda-vel-gate", type=float, default=5.0,
                    help="Velocity gate loss: force 있는데 vel 낮으면 출력 0으로 강제")
     p.add_argument("--epochs", type=int, default=None,
                    help="학습 epoch 수 (미지정 시 src.config.EPOCHS 사용)")
     p.add_argument("--no-eval", action="store_true")
     p.add_argument("--zero-augment-ratio", type=float, default=0.05)
-    p.add_argument("--transition-augment-ratio", type=float, default=0.10,
+    p.add_argument("--transition-augment-ratio", type=float, default=0.20,
                    help="force/velocity 전환 구간 augmentation 비율. "
                         "실제 샘플의 force/vel을 0~최대값으로 교체하고 Y를 gate 비율로 감쇄.")
     p.add_argument("--rescale-y-to-target-rms", action="store_true",
