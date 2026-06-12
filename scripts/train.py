@@ -344,6 +344,24 @@ def vel_gate_loss(pred: torch.Tensor,
     return torch.mean(pred_rms[mask] ** 2)  # 해당 샘플 RMS를 0으로
 
 
+def gate_calibration_loss(gate: torch.Tensor,
+                          force_values: torch.Tensor,
+                          vel_values: torch.Tensor,
+                          force_thresh: float = 0.3, force_full: float = 2.0,
+                          vel_thresh: float = 0.005, vel_full: float = 0.03) -> torch.Tensor:
+    """
+    gate_net 출력을 force_velocity_gate 공식의 target gate 값으로 직접 학습.
+    f=0/v=0 → target=0,  f≥force_full & v≥vel_full → target=1.
+    gate: [B, 1] (model에서 return_gate=True로 받은 값)
+    """
+    f = force_values.float()
+    v = vel_values.float()
+    f_gain = ((f - force_thresh) / (force_full - force_thresh)).clamp(0.0, 1.0)
+    v_gain = ((v - vel_thresh)   / (vel_full   - vel_thresh)).clamp(0.0, 1.0)
+    target = (f_gain * v_gain).unsqueeze(1)  # [B, 1]
+    return torch.mean((gate - target) ** 2)
+
+
 def roughness_cls_loss(ctx: torch.Tensor,
                        roughness_values: torch.Tensor,
                        roughness_head: nn.Module) -> torch.Tensor:
@@ -361,42 +379,45 @@ def roughness_cls_loss(ctx: torch.Tensor,
     return nn.functional.cross_entropy(logits, labels)
 
 
-def combined_loss(pred, ctx, target, roughness_values, force_values, vel_values, roughness_head,
+def combined_loss(pred, ctx, gate, target, roughness_values, force_values, vel_values, roughness_head,
                   lambda_rms=2.0, lambda_contrast=0.6,
                   lambda_centroid=0.0, lambda_hf=0.0,
                   lambda_force=1.0, lambda_profile=2.0, lambda_rough_cls=1.0,
-                  lambda_vel_gate=2.0):
+                  lambda_vel_gate=2.0, lambda_gate_calib=5.0):
     base_loss, loss_dict = total_loss(pred, target)
 
-    l_rms       = roughness_rms_calibration_loss(pred, roughness_values, force_values)
-    l_contrast  = roughness_contrastive_loss(pred, roughness_values)
-    l_centroid  = spectral_centroid_loss(pred, roughness_values)
-    l_hf        = hf_energy_ratio_loss(pred, roughness_values)
-    l_force     = force_contrastive_loss(pred, force_values, vel_values)
-    l_profile   = spectral_profile_loss(pred, roughness_values)
-    l_rough_cls = roughness_cls_loss(ctx, roughness_values, roughness_head)
-    l_vel_gate  = vel_gate_loss(pred, vel_values, force_values)
+    l_rms        = roughness_rms_calibration_loss(pred, roughness_values, force_values)
+    l_contrast   = roughness_contrastive_loss(pred, roughness_values)
+    l_centroid   = spectral_centroid_loss(pred, roughness_values)
+    l_hf         = hf_energy_ratio_loss(pred, roughness_values)
+    l_force      = force_contrastive_loss(pred, force_values, vel_values)
+    l_profile    = spectral_profile_loss(pred, roughness_values)
+    l_rough_cls  = roughness_cls_loss(ctx, roughness_values, roughness_head)
+    l_vel_gate   = vel_gate_loss(pred, vel_values, force_values)
+    l_gate_calib = gate_calibration_loss(gate, force_values, vel_values)
 
     total = (base_loss
-             + lambda_rms       * l_rms
-             + lambda_contrast  * l_contrast
-             + lambda_centroid  * l_centroid
-             + lambda_hf        * l_hf
-             + lambda_force     * l_force
-             + lambda_profile   * l_profile
-             + lambda_rough_cls * l_rough_cls
-             + lambda_vel_gate  * l_vel_gate)
+             + lambda_rms        * l_rms
+             + lambda_contrast   * l_contrast
+             + lambda_centroid   * l_centroid
+             + lambda_hf         * l_hf
+             + lambda_force      * l_force
+             + lambda_profile    * l_profile
+             + lambda_rough_cls  * l_rough_cls
+             + lambda_vel_gate   * l_vel_gate
+             + lambda_gate_calib * l_gate_calib)
 
     loss_dict.update({
-        "rms_calib":  l_rms.item(),
-        "contrast":   l_contrast.item(),
-        "centroid":   l_centroid.item(),
-        "hf_ratio":   l_hf.item(),
-        "force_ctr":  l_force.item(),
-        "profile":    l_profile.item(),
-        "rough_cls":  l_rough_cls.item(),
-        "vel_gate":   l_vel_gate.item(),
-        "total":      total.item(),
+        "rms_calib":   l_rms.item(),
+        "contrast":    l_contrast.item(),
+        "centroid":    l_centroid.item(),
+        "hf_ratio":    l_hf.item(),
+        "force_ctr":   l_force.item(),
+        "profile":     l_profile.item(),
+        "rough_cls":   l_rough_cls.item(),
+        "vel_gate":    l_vel_gate.item(),
+        "gate_calib":  l_gate_calib.item(),
+        "total":       total.item(),
     })
     return total, loss_dict
 
@@ -408,7 +429,7 @@ def run_epoch(loader, model, optimizer, device, args, train=True):
 
     keys = ("point", "diff", "spec", "env",
             "rms_calib", "contrast", "centroid", "hf_ratio",
-            "force_ctr", "profile", "rough_cls", "vel_gate", "total")
+            "force_ctr", "profile", "rough_cls", "vel_gate", "gate_calib", "total")
     loss_log  = {k: 0.0 for k in keys}
     total_count = 0
     preds_all, trues_all = [], []
@@ -420,9 +441,9 @@ def run_epoch(loader, model, optimizer, device, args, train=True):
             optimizer.zero_grad()
 
         with torch.set_grad_enabled(train):
-            pred, ctx = model(xb, return_ctx=True)
+            pred, ctx, gate = model(xb, return_ctx=True, return_gate=True)
             loss, loss_dict = combined_loss(
-                pred, ctx, yb, rb, fb, vb, model.roughness_head,
+                pred, ctx, gate, yb, rb, fb, vb, model.roughness_head,
                 lambda_rms=args.lambda_rms,
                 lambda_contrast=args.lambda_contrast,
                 lambda_centroid=args.lambda_centroid,
@@ -431,6 +452,7 @@ def run_epoch(loader, model, optimizer, device, args, train=True):
                 lambda_profile=args.lambda_profile,
                 lambda_rough_cls=args.lambda_rough_cls,
                 lambda_vel_gate=args.lambda_vel_gate,
+                lambda_gate_calib=args.lambda_gate_calib,
             )
             if train:
                 loss.backward()
@@ -559,6 +581,29 @@ def main(args):
         print(f"[HARD GATE AUG] {n_hard} hard-gate samples added "
               f"({args.hard_gate_augment_ratio*100:.0f}% of real train) -> total {len(X_train)})")
 
+    # --- Contact-end augmentation ---
+    # real acc 히스토리가 있는 상태에서 force/vel이 윈도우 중간에 0으로 떨어지는 샘플.
+    # gate_net이 보는 x[:, 1, -1] / x[:, 2, -1] = 0이 되므로 Y=0을 직접 학습.
+    # "과거 acc가 있어도 현재 force/vel=0이면 즉시 출력=0" 케이스를 커버.
+    if args.contact_end_augment_ratio > 0:
+        n_end = int(n_real * args.contact_end_augment_ratio)
+        rng_end = np.random.default_rng(45)
+
+        idx = rng_end.integers(0, n_real, size=n_end)
+        X_end = X_train[idx].copy()
+        Y_end = np.zeros((n_end, Y_train.shape[1]), dtype=np.float32)
+
+        # 윈도우 후반부(50~100% 지점)에서 force/vel을 0으로 드롭 → 마지막 샘플은 항상 0
+        drop_t = rng_end.integers(INPUT_STEPS // 2, INPUT_STEPS, size=n_end)
+        for i, t in enumerate(drop_t):
+            X_end[i, 1, t:] = 0.0  # force drop
+            X_end[i, 2, t:] = 0.0  # velocity drop
+
+        X_train = np.concatenate([X_train, X_end], axis=0)
+        Y_train = np.concatenate([Y_train, Y_end], axis=0)
+        print(f"[CONTACT-END AUG] {n_end} contact-end samples added "
+              f"({args.contact_end_augment_ratio*100:.0f}% of real train) -> total {len(X_train)}")
+
     print("[DATA SHAPES]")
     for name, arr in [("X_train", X_train), ("X_val", X_val), ("X_test", X_test)]:
         print(f"  {name}: {arr.shape}")
@@ -623,13 +668,14 @@ def main(args):
     val_ds.roughness   = torch.from_numpy((X_val[:,   3, 0] * 100.0).astype(np.float32))
     test_ds.roughness  = torch.from_numpy((X_test[:,  3, 0] * 100.0).astype(np.float32))
 
-    train_ds.force = torch.from_numpy(X_train[:, 1, 0].astype(np.float32))
-    val_ds.force   = torch.from_numpy(X_val[:,   1, 0].astype(np.float32))
-    test_ds.force  = torch.from_numpy(X_test[:,  1, 0].astype(np.float32))
+    # Use LAST sample to match gate_net which reads x[:, 1, -1] / x[:, 2, -1]
+    train_ds.force = torch.from_numpy(X_train[:, 1, -1].astype(np.float32))
+    val_ds.force   = torch.from_numpy(X_val[:,   1, -1].astype(np.float32))
+    test_ds.force  = torch.from_numpy(X_test[:,  1, -1].astype(np.float32))
 
-    train_ds.vel = torch.from_numpy(X_train[:, 2, 0].astype(np.float32))
-    val_ds.vel   = torch.from_numpy(X_val[:,   2, 0].astype(np.float32))
-    test_ds.vel  = torch.from_numpy(X_test[:,  2, 0].astype(np.float32))
+    train_ds.vel = torch.from_numpy(X_train[:, 2, -1].astype(np.float32))
+    val_ds.vel   = torch.from_numpy(X_val[:,   2, -1].astype(np.float32))
+    test_ds.vel  = torch.from_numpy(X_test[:,  2, -1].astype(np.float32))
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=0)
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
@@ -900,8 +946,12 @@ def build_args():
                    help="Roughness cls loss on hidden ctx (train-only, zero inference overhead)")
     p.add_argument("--hard-gate-augment-ratio", type=float, default=0.10,
                    help="real acc + force=0, vel=0 → Y=0 샘플 추가 비율")
+    p.add_argument("--contact-end-augment-ratio", type=float, default=0.15,
+                   help="acc 있다가 force/vel이 윈도우 중간에 0으로 떨어지는 샘플 추가 비율")
     p.add_argument("--lambda-vel-gate", type=float, default=5.0,
                    help="Velocity gate loss: force 있는데 vel 낮으면 출력 0으로 강제")
+    p.add_argument("--lambda-gate-calib", type=float, default=5.0,
+                   help="Gate calibration loss: gate_net 출력을 force_velocity_gate 공식 target으로 직접 학습")
     p.add_argument("--epochs", type=int, default=None,
                    help="학습 epoch 수 (미지정 시 src.config.EPOCHS 사용)")
     p.add_argument("--no-eval", action="store_true")

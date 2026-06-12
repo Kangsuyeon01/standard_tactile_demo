@@ -64,7 +64,7 @@ class LiteSeq2SeqCNNGRU_AttnPool(nn.Module):
             nn.Linear(16, 1), nn.Sigmoid(),
         )
 
-    def forward(self, x: torch.Tensor, return_ctx: bool = False):
+    def forward(self, x: torch.Tensor, return_ctx: bool = False, return_gate: bool = False):
         r = x[:, 3, 0:1]               # [B, 1]  roughness 0~1 (상수 채널)
         h = self.conv1(x[:, :3, :])    # [B, 24, T]  dynamic 3채널만
         h = self.conv2(h)              # [B, 32, T]
@@ -88,8 +88,12 @@ class LiteSeq2SeqCNNGRU_AttnPool(nn.Module):
         gate = self.gate_net(torch.cat([f_curr, v_curr], dim=1))  # [B, 1]
         out = out * gate                         # [B, output_steps]
 
+        if return_ctx and return_gate:
+            return out, ctx, gate
         if return_ctx:
             return out, ctx
+        if return_gate:
+            return out, gate
         return out
 
 
