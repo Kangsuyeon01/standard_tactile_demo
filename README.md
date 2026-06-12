@@ -37,7 +37,11 @@ pip install onnx>=1.14 onnxruntime>=1.16
 
 ### 소켓 통신 실행 (Unity 연동용)
 
+gpu 사용 파일로 실행
 ```bash
 python -m scripts.realtime --pt-path pt_files/runs/20260612-003/best_model.pt --cache-path pt_files/inference_cache_allinone.npz
 ```
-
+onnx 파일로 실행
+```bash
+python -m scripts.realtime --onnx-path pt_files/runs/20260612-003/best_model.onnx --cache-path pt_files/inference_cache_allinone.npz
+```
