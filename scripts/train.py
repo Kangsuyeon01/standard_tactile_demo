@@ -767,6 +767,7 @@ def main(args):
 
         print("\n[AUTO EVAL 4/4] gen_ramp_plots.py ...")
         # ONNX export (없으면 자동 생성)
+        _onnx = run_dir / "best_model.onnx"
         if not _onnx.exists():
             print("[AUTO EVAL 4/4] exporting ONNX ...")
             subprocess.run(
@@ -776,7 +777,6 @@ def main(args):
                  "--onnx-path", str(_onnx)],
                 cwd=cwd,
             )
-        _onnx = run_dir / "best_model.onnx"
         if _onnx.exists() and _allinone_npz.exists():
             r4 = subprocess.run(
                 [_sys.executable, "-m", "scripts.gen_ramp_plots",
