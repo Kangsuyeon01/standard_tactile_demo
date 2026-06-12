@@ -1121,7 +1121,7 @@ def build_argparser():
     p.add_argument("--no-enhance-roughness", action="store_true")
     p.add_argument("--no-output-limit", action="store_true")
     p.add_argument("--no-force-gate", action="store_true",
-                   help="force_velocity_gate 비활성화 (모델이 학습한 gating 효과만 평가할 때 사용)")
+                   help="force_velocity_gate 비활성화. gate_net 내장 모델 사용 시 권장")
     p.add_argument("--save-test-signal", action="store_true")
     p.add_argument("--onnx-path", type=str, default=None,
                    help="ONNX 파일 경로. 지정하면 ONNX Runtime으로 추론 (3-5x 빠름). "

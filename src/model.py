@@ -57,6 +57,12 @@ class LiteSeq2SeqCNNGRU_AttnPool(nn.Module):
         self.roughness_head = nn.Sequential(
             nn.Linear(32, 16), nn.GELU(), nn.Linear(16, n_roughness_classes),
         )
+        # Force/velocity amplitude gate: (force, vel) → scalar gate [0, 1]
+        # acc 히스토리와 무관하게 force=0/vel=0이면 출력을 억제
+        self.gate_net = nn.Sequential(
+            nn.Linear(2, 16), nn.ReLU(),
+            nn.Linear(16, 1), nn.Sigmoid(),
+        )
 
     def forward(self, x: torch.Tensor, return_ctx: bool = False):
         r = x[:, 3, 0:1]               # [B, 1]  roughness 0~1 (상수 채널)
@@ -74,6 +80,13 @@ class LiteSeq2SeqCNNGRU_AttnPool(nn.Module):
         w   = torch.softmax(self.attn(h), dim=1) # [B, T, 1]
         ctx = (h * w).sum(dim=1)                 # [B, 32]
         out = self.head(ctx)                     # [B, output_steps]
+
+        # Force/velocity gate: 윈도우 평균 force/vel → 진폭 게이트
+        f_mean = x[:, 1, :].mean(dim=1, keepdim=True)  # [B, 1]
+        v_mean = x[:, 2, :].mean(dim=1, keepdim=True)  # [B, 1]
+        gate = self.gate_net(torch.cat([f_mean, v_mean], dim=1))  # [B, 1]
+        out = out * gate                         # [B, output_steps]
+
         if return_ctx:
             return out, ctx
         return out
