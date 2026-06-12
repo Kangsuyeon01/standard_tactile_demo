@@ -81,10 +81,11 @@ class LiteSeq2SeqCNNGRU_AttnPool(nn.Module):
         ctx = (h * w).sum(dim=1)                 # [B, 32]
         out = self.head(ctx)                     # [B, output_steps]
 
-        # Force/velocity gate: 윈도우 평균 force/vel → 진폭 게이트
-        f_mean = x[:, 1, :].mean(dim=1, keepdim=True)  # [B, 1]
-        v_mean = x[:, 2, :].mean(dim=1, keepdim=True)  # [B, 1]
-        gate = self.gate_net(torch.cat([f_mean, v_mean], dim=1))  # [B, 1]
+        # Force/velocity gate: 가장 최근 force/vel 값으로 즉시 반응
+        # 윈도우 평균 대신 마지막 샘플 사용 → force/vel 변화에 즉시 반응
+        f_curr = x[:, 1, -1:]   # [B, 1]
+        v_curr = x[:, 2, -1:]   # [B, 1]
+        gate = self.gate_net(torch.cat([f_curr, v_curr], dim=1))  # [B, 1]
         out = out * gate                         # [B, output_steps]
 
         if return_ctx:
