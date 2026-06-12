@@ -447,9 +447,11 @@ def main(args):
     X_val,   Y_val   = npz["X_val"],   npz["Y_val"]
     X_test,  Y_test  = npz["X_test"],  npz["Y_test"]
 
+    n_real = len(X_train)  # augmentation 전 실제 샘플 수
+
     # --- Zero-contact augmentation ---
     if args.zero_augment_ratio > 0:
-        n_zero = int(len(X_train) * args.zero_augment_ratio)
+        n_zero = int(n_real * args.zero_augment_ratio)
         roughness_vals = np.unique(np.round(X_train[:, 3, 0] * 100)).astype(np.float32)
         rng = np.random.default_rng(42)
         r_samples = rng.choice(roughness_vals, size=n_zero) / 100.0
@@ -470,6 +472,39 @@ def main(args):
         Y_val   = rescale_y_to_target_rms(X_val,   Y_val)
         # test는 원본 유지 (평가 공정성)
         print("[RESCALE] Note: Y_test kept as original for fair evaluation.")
+
+    # --- Transition-zone augmentation ---
+    # force/velocity가 0~최대값 사이인 전환 구간을 학습에 포함.
+    # realtime.py의 force_velocity_gate와 동일한 파라미터로 Y를 스케일링.
+    if args.transition_augment_ratio > 0:
+        _FORCE_THRESH, _FORCE_FULL = 0.3, 2.0
+        _VEL_THRESH,   _VEL_FULL   = 0.005, 0.03
+
+        n_trans = int(n_real * args.transition_augment_ratio)
+        rng_trans = np.random.default_rng(43)
+
+        # 실제 샘플에서만 복사 (zero-augment 샘플 제외)
+        idx = rng_trans.integers(0, n_real, size=n_trans)
+        X_trans = X_train[idx].copy()
+        Y_trans = Y_train[idx].copy()
+
+        # force/velocity를 전환 구간 내 랜덤값으로 교체
+        f_vals = rng_trans.uniform(0.0, _FORCE_FULL, size=n_trans).astype(np.float32)
+        v_vals = rng_trans.uniform(0.0, _VEL_FULL,   size=n_trans).astype(np.float32)
+
+        # gate 계산 (force_velocity_gate와 동일한 공식)
+        f_gain = np.clip((f_vals - _FORCE_THRESH) / (_FORCE_FULL - _FORCE_THRESH), 0.0, 1.0)
+        v_gain = np.clip((v_vals - _VEL_THRESH)   / (_VEL_FULL   - _VEL_THRESH),   0.0, 1.0)
+        gate   = (f_gain * v_gain).astype(np.float32)
+
+        X_trans[:, 1, :] = f_vals[:, None]  # force 채널 교체
+        X_trans[:, 2, :] = v_vals[:, None]  # velocity 채널 교체
+        Y_trans = Y_trans * gate[:, None]   # gate 비율로 Y 감쇄
+
+        X_train = np.concatenate([X_train, X_trans], axis=0)
+        Y_train = np.concatenate([Y_train, Y_trans], axis=0)
+        print(f"[TRANSITION AUG] {n_trans} transition samples added "
+              f"({args.transition_augment_ratio*100:.0f}% of real train) -> total {len(X_train)}")
 
     print("[DATA SHAPES]")
     for name, arr in [("X_train", X_train), ("X_val", X_val), ("X_test", X_test)]:
@@ -814,6 +849,9 @@ def build_args():
                    help="학습 epoch 수 (미지정 시 src.config.EPOCHS 사용)")
     p.add_argument("--no-eval", action="store_true")
     p.add_argument("--zero-augment-ratio", type=float, default=0.05)
+    p.add_argument("--transition-augment-ratio", type=float, default=0.10,
+                   help="force/velocity 전환 구간 augmentation 비율. "
+                        "실제 샘플의 force/vel을 0~최대값으로 교체하고 Y를 gate 비율로 감쇄.")
     p.add_argument("--rescale-y-to-target-rms", action="store_true",
                    help="훈련 Y를 roughness별 target RMS로 per-sample rescaling. "
                         "모델이 roughness→amplitude 관계를 직접 학습.")
