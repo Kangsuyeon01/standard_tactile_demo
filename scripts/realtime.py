@@ -731,6 +731,12 @@ class RealtimeReferenceGuidedGenerator:
 
         return np.asarray(out_final, dtype=np.float32), None
 
+    def override_last_output(self, signal):
+        """post-processing(gate 등) 적용 후 신호를 acc_buf에 반영.
+        gate로 줄어든 출력이 다음 예측의 입력에도 반영되도록 한다."""
+        n = min(len(signal), self.input_steps)
+        self.acc_buf[-n:] = np.asarray(signal[:n], dtype=np.float32)
+
 # =========================================================
 # 5) Live plot mode
 # =========================================================
@@ -764,9 +770,16 @@ def run_live_plot(args):
 
     print("[LIVE] loading cache …")
     cache = InferenceCache(args.cache_path)
+    pt_path = args.pt_path
+    onnx_path = getattr(args, "onnx_path", None)
+    if onnx_path is not None and pt_path == "pt_files/best_model_light.pt":
+        candidate = Path(onnx_path).parent / "best_model.pt"
+        if candidate.exists():
+            pt_path = str(candidate)
     model, x_mean, x_std, y_mean, y_std = load_model_from_pt(
-        args.pt_path, device=device, in_ch=3,
+        pt_path, device=device, in_ch=3,
         output_steps=args.output_steps,
+        onnx_path=onnx_path,
     )
 
     def _make_generator(roughness):
@@ -887,7 +900,9 @@ def run_live_plot(args):
             acc = enhance_acc_by_roughness(acc, r, rng=rng)
         if not args.no_output_limit:
             acc = apply_common_output_limit(acc, r, velocity=v)
-        acc = force_velocity_gate(acc, f, v)
+        if not args.no_force_gate:
+            acc = force_velocity_gate(acc, f, v)
+        rt_holder[0].override_last_output(acc)
 
         acc_buf.extend(acc.tolist())
         data    = np.asarray(acc_buf, dtype=np.float32)
@@ -1077,7 +1092,8 @@ def start_socket_server(args):
 
                     if not args.no_enhance_roughness: acc = enhance_acc_by_roughness(acc, roughness, rng=rng)
                     if not args.no_output_limit: acc = apply_common_output_limit(acc, roughness, velocity=speed)
-                    acc = force_velocity_gate(acc, force_mag, speed)
+                    if not args.no_force_gate: acc = force_velocity_gate(acc, force_mag, speed)
+                    rt.override_last_output(acc)
                     wave_data = acc_to_uint16_wave(acc, device_num=int(user_id)%2, channel_num=int(fingerIdx))
                     client_socket.sendall(struct.pack(f"<{num_samples}H", *wave_data))
 
@@ -1104,6 +1120,8 @@ def build_argparser():
     p.add_argument("--roughness-change-threshold", type=float, default=0.25)
     p.add_argument("--no-enhance-roughness", action="store_true")
     p.add_argument("--no-output-limit", action="store_true")
+    p.add_argument("--no-force-gate", action="store_true",
+                   help="force_velocity_gate 비활성화 (모델이 학습한 gating 효과만 평가할 때 사용)")
     p.add_argument("--save-test-signal", action="store_true")
     p.add_argument("--onnx-path", type=str, default=None,
                    help="ONNX 파일 경로. 지정하면 ONNX Runtime으로 추론 (3-5x 빠름). "

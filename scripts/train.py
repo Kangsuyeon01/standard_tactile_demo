@@ -298,24 +298,50 @@ def spectral_profile_loss(pred: torch.Tensor,
 
 def force_contrastive_loss(pred: torch.Tensor,
                             force_values: torch.Tensor,
-                            min_f_diff: float = 0.3) -> torch.Tensor:
+                            vel_values: torch.Tensor | None = None,
+                            min_f_diff: float = 0.3,
+                            vel_thresh: float = 0.005) -> torch.Tensor:
     """
     Force 높은 쪽의 RMS >= Force 낮은 쪽의 RMS 를 강제.
-    min_f_diff(N) 이상 차이나는 쌍만 고려.
-
-    force_values: [B]  (un-normalized, N 단위)
+    velocity 낮은 샘플은 제외 — transition aug 샘플(low vel → Y≈0)과 충돌 방지.
     """
     pred_rms = torch.sqrt(torch.mean(pred ** 2, dim=1) + 1e-8)  # [B]
     f = force_values.float()
 
-    # f_i - f_j  > min_f_diff  -->  rms_i should be >= rms_j
-    f_diff   = f.unsqueeze(1) - f.unsqueeze(0)      # [B, B]: row=i, col=j -> f_i - f_j
-    rms_diff = pred_rms.unsqueeze(1) - pred_rms.unsqueeze(0)  # rms_i - rms_j
+    # velocity 충분한 샘플만 비교 (양쪽 모두 vel >= thresh)
+    if vel_values is not None:
+        v = vel_values.float()
+        active = (v >= vel_thresh)
+        active_pair = active.unsqueeze(0) & active.unsqueeze(1)  # [B, B]
+    else:
+        active_pair = torch.ones(len(f), len(f), dtype=torch.bool, device=f.device)
 
-    mask      = (f_diff > min_f_diff).float()
-    violation = torch.relu(-rms_diff)               # penalize when rms_i < rms_j
+    f_diff   = f.unsqueeze(1) - f.unsqueeze(0)
+    rms_diff = pred_rms.unsqueeze(1) - pred_rms.unsqueeze(0)
+
+    mask      = (f_diff > min_f_diff).float() * active_pair.float()
+    violation = torch.relu(-rms_diff)
     count     = mask.sum().clamp(min=1)
     return (violation * mask).sum() / count
+
+
+def vel_gate_loss(pred: torch.Tensor,
+                  vel_values: torch.Tensor,
+                  force_values: torch.Tensor,
+                  vel_thresh: float = 0.005,
+                  force_thresh: float = 0.3) -> torch.Tensor:
+    """
+    Force는 충분한데 velocity가 낮으면 출력이 0에 가까워야 함.
+    transition aug만으로 부족한 velocity gating을 loss로 직접 강제.
+    """
+    pred_rms = torch.sqrt(torch.mean(pred ** 2, dim=1) + 1e-8)
+    f = force_values.float()
+    v = vel_values.float()
+
+    mask = (f >= force_thresh) & (v < vel_thresh)
+    if mask.sum() < 1:
+        return torch.tensor(0.0, device=pred.device, requires_grad=True)
+    return torch.mean(pred_rms[mask] ** 2)  # 해당 샘플 RMS를 0으로
 
 
 def roughness_cls_loss(ctx: torch.Tensor,
@@ -335,19 +361,21 @@ def roughness_cls_loss(ctx: torch.Tensor,
     return nn.functional.cross_entropy(logits, labels)
 
 
-def combined_loss(pred, ctx, target, roughness_values, force_values, roughness_head,
+def combined_loss(pred, ctx, target, roughness_values, force_values, vel_values, roughness_head,
                   lambda_rms=2.0, lambda_contrast=0.6,
                   lambda_centroid=0.0, lambda_hf=0.0,
-                  lambda_force=1.0, lambda_profile=2.0, lambda_rough_cls=1.0):
+                  lambda_force=1.0, lambda_profile=2.0, lambda_rough_cls=1.0,
+                  lambda_vel_gate=2.0):
     base_loss, loss_dict = total_loss(pred, target)
 
     l_rms       = roughness_rms_calibration_loss(pred, roughness_values, force_values)
     l_contrast  = roughness_contrastive_loss(pred, roughness_values)
     l_centroid  = spectral_centroid_loss(pred, roughness_values)
     l_hf        = hf_energy_ratio_loss(pred, roughness_values)
-    l_force     = force_contrastive_loss(pred, force_values)
+    l_force     = force_contrastive_loss(pred, force_values, vel_values)
     l_profile   = spectral_profile_loss(pred, roughness_values)
     l_rough_cls = roughness_cls_loss(ctx, roughness_values, roughness_head)
+    l_vel_gate  = vel_gate_loss(pred, vel_values, force_values)
 
     total = (base_loss
              + lambda_rms       * l_rms
@@ -356,7 +384,8 @@ def combined_loss(pred, ctx, target, roughness_values, force_values, roughness_h
              + lambda_hf        * l_hf
              + lambda_force     * l_force
              + lambda_profile   * l_profile
-             + lambda_rough_cls * l_rough_cls)
+             + lambda_rough_cls * l_rough_cls
+             + lambda_vel_gate  * l_vel_gate)
 
     loss_dict.update({
         "rms_calib":  l_rms.item(),
@@ -366,6 +395,7 @@ def combined_loss(pred, ctx, target, roughness_values, force_values, roughness_h
         "force_ctr":  l_force.item(),
         "profile":    l_profile.item(),
         "rough_cls":  l_rough_cls.item(),
+        "vel_gate":   l_vel_gate.item(),
         "total":      total.item(),
     })
     return total, loss_dict
@@ -378,13 +408,13 @@ def run_epoch(loader, model, optimizer, device, args, train=True):
 
     keys = ("point", "diff", "spec", "env",
             "rms_calib", "contrast", "centroid", "hf_ratio",
-            "force_ctr", "profile", "rough_cls", "total")
+            "force_ctr", "profile", "rough_cls", "vel_gate", "total")
     loss_log  = {k: 0.0 for k in keys}
     total_count = 0
     preds_all, trues_all = [], []
 
     for xb, yb, rb, fb, vb in loader:
-        xb, yb, rb, fb = xb.to(device), yb.to(device), rb.to(device), fb.to(device)
+        xb, yb, rb, fb, vb = xb.to(device), yb.to(device), rb.to(device), fb.to(device), vb.to(device)
 
         if train:
             optimizer.zero_grad()
@@ -392,7 +422,7 @@ def run_epoch(loader, model, optimizer, device, args, train=True):
         with torch.set_grad_enabled(train):
             pred, ctx = model(xb, return_ctx=True)
             loss, loss_dict = combined_loss(
-                pred, ctx, yb, rb, fb, model.roughness_head,
+                pred, ctx, yb, rb, fb, vb, model.roughness_head,
                 lambda_rms=args.lambda_rms,
                 lambda_contrast=args.lambda_contrast,
                 lambda_centroid=args.lambda_centroid,
@@ -400,6 +430,7 @@ def run_epoch(loader, model, optimizer, device, args, train=True):
                 lambda_force=args.lambda_force,
                 lambda_profile=args.lambda_profile,
                 lambda_rough_cls=args.lambda_rough_cls,
+                lambda_vel_gate=args.lambda_vel_gate,
             )
             if train:
                 loss.backward()
@@ -447,9 +478,11 @@ def main(args):
     X_val,   Y_val   = npz["X_val"],   npz["Y_val"]
     X_test,  Y_test  = npz["X_test"],  npz["Y_test"]
 
+    n_real = len(X_train)  # augmentation 전 실제 샘플 수
+
     # --- Zero-contact augmentation ---
     if args.zero_augment_ratio > 0:
-        n_zero = int(len(X_train) * args.zero_augment_ratio)
+        n_zero = int(n_real * args.zero_augment_ratio)
         roughness_vals = np.unique(np.round(X_train[:, 3, 0] * 100)).astype(np.float32)
         rng = np.random.default_rng(42)
         r_samples = rng.choice(roughness_vals, size=n_zero) / 100.0
@@ -470,6 +503,61 @@ def main(args):
         Y_val   = rescale_y_to_target_rms(X_val,   Y_val)
         # test는 원본 유지 (평가 공정성)
         print("[RESCALE] Note: Y_test kept as original for fair evaluation.")
+
+    # --- Transition-zone augmentation ---
+    # force/velocity가 0~최대값 사이인 전환 구간을 학습에 포함.
+    # realtime.py의 force_velocity_gate와 동일한 파라미터로 Y를 스케일링.
+    if args.transition_augment_ratio > 0:
+        _FORCE_THRESH, _FORCE_FULL = 0.3, 2.0
+        _VEL_THRESH,   _VEL_FULL   = 0.005, 0.03
+
+        n_trans = int(n_real * args.transition_augment_ratio)
+        rng_trans = np.random.default_rng(43)
+
+        # 실제 샘플에서만 복사 (zero-augment 샘플 제외)
+        idx = rng_trans.integers(0, n_real, size=n_trans)
+        X_trans = X_train[idx].copy()
+        Y_trans = Y_train[idx].copy()
+
+        # force/velocity를 전환 구간 내 랜덤값으로 교체
+        # vel 샘플링은 gate 기준(vel_full=0.03)보다 넓게 0.20까지 커버:
+        # vel > vel_full이면 v_gain=1.0으로 클램프되므로 force 게이팅만 학습
+        f_vals = rng_trans.uniform(0.0, _FORCE_FULL, size=n_trans).astype(np.float32)
+        v_vals = rng_trans.uniform(0.0, 0.20,        size=n_trans).astype(np.float32)
+
+        # gate 계산 (force_velocity_gate와 동일한 공식)
+        f_gain = np.clip((f_vals - _FORCE_THRESH) / (_FORCE_FULL - _FORCE_THRESH), 0.0, 1.0)
+        v_gain = np.clip((v_vals - _VEL_THRESH)   / (_VEL_FULL   - _VEL_THRESH),   0.0, 1.0)
+        gate   = (f_gain * v_gain).astype(np.float32)
+
+        X_trans[:, 1, :] = f_vals[:, None]  # force 채널 교체
+        X_trans[:, 2, :] = v_vals[:, None]  # velocity 채널 교체
+        Y_trans = Y_trans * gate[:, None]   # gate 비율로 Y 감쇄
+
+        X_train = np.concatenate([X_train, X_trans], axis=0)
+        Y_train = np.concatenate([Y_train, Y_trans], axis=0)
+        print(f"[TRANSITION AUG] {n_trans} transition samples added "
+              f"({args.transition_augment_ratio*100:.0f}% of real train) -> total {len(X_train)}")
+
+    # --- Hard-gate augmentation ---
+    # real acc 히스토리 + force=0, vel=0 → Y=0
+    # transition aug만으로는 force=0 샘플 비중이 낮아서 별도 추가.
+    if args.hard_gate_augment_ratio > 0:
+        n_hard = int(n_real * args.hard_gate_augment_ratio)
+        rng_hard = np.random.default_rng(44)
+
+        idx = rng_hard.integers(0, n_real, size=n_hard)
+        X_hard = X_train[idx].copy()
+        Y_hard = np.zeros((n_hard, Y_train.shape[1]), dtype=np.float32)
+
+        X_hard[:, 1, :] = 0.0  # force=0
+        X_hard[:, 2, :] = 0.0  # velocity=0
+        # acc 채널(ch0)은 real 신호 그대로 유지 → "acc 있어도 force=0이면 출력=0" 학습
+
+        X_train = np.concatenate([X_train, X_hard], axis=0)
+        Y_train = np.concatenate([Y_train, Y_hard], axis=0)
+        print(f"[HARD GATE AUG] {n_hard} hard-gate samples added "
+              f"({args.hard_gate_augment_ratio*100:.0f}% of real train) -> total {len(X_train)})")
 
     print("[DATA SHAPES]")
     for name, arr in [("X_train", X_train), ("X_val", X_val), ("X_test", X_test)]:
@@ -810,10 +898,17 @@ def build_args():
                    help="Spectral profile loss: match roughness-specific FFT shape from training data")
     p.add_argument("--lambda-rough-cls", type=float, default=1.0,
                    help="Roughness cls loss on hidden ctx (train-only, zero inference overhead)")
+    p.add_argument("--hard-gate-augment-ratio", type=float, default=0.10,
+                   help="real acc + force=0, vel=0 → Y=0 샘플 추가 비율")
+    p.add_argument("--lambda-vel-gate", type=float, default=5.0,
+                   help="Velocity gate loss: force 있는데 vel 낮으면 출력 0으로 강제")
     p.add_argument("--epochs", type=int, default=None,
                    help="학습 epoch 수 (미지정 시 src.config.EPOCHS 사용)")
     p.add_argument("--no-eval", action="store_true")
     p.add_argument("--zero-augment-ratio", type=float, default=0.05)
+    p.add_argument("--transition-augment-ratio", type=float, default=0.20,
+                   help="force/velocity 전환 구간 augmentation 비율. "
+                        "실제 샘플의 force/vel을 0~최대값으로 교체하고 Y를 gate 비율로 감쇄.")
     p.add_argument("--rescale-y-to-target-rms", action="store_true",
                    help="훈련 Y를 roughness별 target RMS로 per-sample rescaling. "
                         "모델이 roughness→amplitude 관계를 직접 학습.")
