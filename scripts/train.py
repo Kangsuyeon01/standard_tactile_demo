@@ -489,8 +489,10 @@ def main(args):
         Y_trans = Y_train[idx].copy()
 
         # force/velocity를 전환 구간 내 랜덤값으로 교체
+        # vel 샘플링은 gate 기준(vel_full=0.03)보다 넓게 0.20까지 커버:
+        # vel > vel_full이면 v_gain=1.0으로 클램프되므로 force 게이팅만 학습
         f_vals = rng_trans.uniform(0.0, _FORCE_FULL, size=n_trans).astype(np.float32)
-        v_vals = rng_trans.uniform(0.0, _VEL_FULL,   size=n_trans).astype(np.float32)
+        v_vals = rng_trans.uniform(0.0, 0.20,        size=n_trans).astype(np.float32)
 
         # gate 계산 (force_velocity_gate와 동일한 공식)
         f_gain = np.clip((f_vals - _FORCE_THRESH) / (_FORCE_FULL - _FORCE_THRESH), 0.0, 1.0)
