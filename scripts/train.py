@@ -209,13 +209,20 @@ class SeqDatasetWithRoughness(Dataset):
 def roughness_rms_calibration_loss(pred: torch.Tensor,
                                     roughness_values: torch.Tensor,
                                     force_values: torch.Tensor | None = None,
-                                    force_thresh: float = 0.1) -> torch.Tensor:
-    # Exclude zero-contact (zero-augment) samples: rms_calib contradicts Y=0 target.
-    if force_values is not None:
-        contact_mask = (force_values.detach().abs() >= force_thresh)
+                                    vel_values: torch.Tensor | None = None,
+                                    force_thresh: float = 0.1,
+                                    vel_thresh: float = 0.005) -> torch.Tensor:
+    # Exclude zero-contact samples (force=0 or vel=0): rms_calib contradicts Y=0 target.
+    # vel_zero_aug has F>0 but V=0 → must also be excluded.
+    if force_values is not None or vel_values is not None:
+        contact_mask = torch.ones(len(pred), dtype=torch.bool, device=pred.device)
+        if force_values is not None:
+            contact_mask = contact_mask & (force_values.detach().abs() >= force_thresh)
+        if vel_values is not None:
+            contact_mask = contact_mask & (vel_values.detach().abs() >= vel_thresh)
         if contact_mask.sum() < 2:
             return torch.tensor(0.0, device=pred.device, requires_grad=True)
-        pred          = pred[contact_mask]
+        pred             = pred[contact_mask]
         roughness_values = roughness_values[contact_mask]
 
     r_np = roughness_values.detach().cpu().numpy()
@@ -386,7 +393,7 @@ def combined_loss(pred, ctx, gate, target, roughness_values, force_values, vel_v
                   lambda_vel_gate=2.0, lambda_gate_calib=5.0):
     base_loss, loss_dict = total_loss(pred, target)
 
-    l_rms        = roughness_rms_calibration_loss(pred, roughness_values, force_values)
+    l_rms        = roughness_rms_calibration_loss(pred, roughness_values, force_values, vel_values)
     l_contrast   = roughness_contrastive_loss(pred, roughness_values)
     l_centroid   = spectral_centroid_loss(pred, roughness_values)
     l_hf         = hf_energy_ratio_loss(pred, roughness_values)
@@ -603,6 +610,41 @@ def main(args):
         Y_train = np.concatenate([Y_train, Y_end], axis=0)
         print(f"[CONTACT-END AUG] {n_end} contact-end samples added "
               f"({args.contact_end_augment_ratio*100:.0f}% of real train) -> total {len(X_train)}")
+
+    # --- Force-zero augmentation ---
+    # real acc + real vel + force=0 → Y=0
+    # "force 없으면 velocity가 뭐든 출력=0" 을 직접 학습.
+    # hard_gate_aug(F=0,V=0)만으로는 V≠0일 때 F=0 케이스를 커버 못함.
+    if args.force_zero_augment_ratio > 0:
+        n_fz = int(n_real * args.force_zero_augment_ratio)
+        rng_fz = np.random.default_rng(46)
+
+        idx = rng_fz.integers(0, n_real, size=n_fz)
+        X_fz = X_train[idx].copy()
+        Y_fz = np.zeros((n_fz, Y_train.shape[1]), dtype=np.float32)
+        X_fz[:, 1, :] = 0.0   # force=0, velocity는 real 값 유지
+
+        X_train = np.concatenate([X_train, X_fz], axis=0)
+        Y_train = np.concatenate([Y_train, Y_fz], axis=0)
+        print(f"[FORCE-ZERO AUG] {n_fz} samples added "
+              f"({args.force_zero_augment_ratio*100:.0f}% of real train) -> total {len(X_train)}")
+
+    # --- Velocity-zero augmentation ---
+    # real acc + real force + vel=0 → Y=0
+    # "velocity 없으면 force가 얼마든 출력=0" 을 직접 학습.
+    if args.vel_zero_augment_ratio > 0:
+        n_vz = int(n_real * args.vel_zero_augment_ratio)
+        rng_vz = np.random.default_rng(47)
+
+        idx = rng_vz.integers(0, n_real, size=n_vz)
+        X_vz = X_train[idx].copy()
+        Y_vz = np.zeros((n_vz, Y_train.shape[1]), dtype=np.float32)
+        X_vz[:, 2, :] = 0.0   # vel=0, force는 real 값 유지
+
+        X_train = np.concatenate([X_train, X_vz], axis=0)
+        Y_train = np.concatenate([Y_train, Y_vz], axis=0)
+        print(f"[VEL-ZERO AUG] {n_vz} samples added "
+              f"({args.vel_zero_augment_ratio*100:.0f}% of real train) -> total {len(X_train)}")
 
     print("[DATA SHAPES]")
     for name, arr in [("X_train", X_train), ("X_val", X_val), ("X_test", X_test)]:
@@ -948,9 +990,13 @@ def build_args():
                    help="real acc + force=0, vel=0 → Y=0 샘플 추가 비율")
     p.add_argument("--contact-end-augment-ratio", type=float, default=0.15,
                    help="acc 있다가 force/vel이 윈도우 중간에 0으로 떨어지는 샘플 추가 비율")
+    p.add_argument("--force-zero-augment-ratio", type=float, default=0.15,
+                   help="real acc + real vel + force=0 → Y=0 샘플 비율 (F=0이면 vel 무관 출력=0 학습)")
+    p.add_argument("--vel-zero-augment-ratio", type=float, default=0.15,
+                   help="real acc + real force + vel=0 → Y=0 샘플 비율 (V=0이면 force 무관 출력=0 학습)")
     p.add_argument("--lambda-vel-gate", type=float, default=5.0,
                    help="Velocity gate loss: force 있는데 vel 낮으면 출력 0으로 강제")
-    p.add_argument("--lambda-gate-calib", type=float, default=5.0,
+    p.add_argument("--lambda-gate-calib", type=float, default=10.0,
                    help="Gate calibration loss: gate_net 출력을 force_velocity_gate 공식 target으로 직접 학습")
     p.add_argument("--epochs", type=int, default=None,
                    help="학습 epoch 수 (미지정 시 src.config.EPOCHS 사용)")
