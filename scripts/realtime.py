@@ -731,8 +731,16 @@ class RealtimeReferenceGuidedGenerator:
             if self.mode == "pure":
                 final = pred
             else:
-                guide = self.get_guide_chunk(self.output_steps)
-                final = (1.0 - self.ref_blend) * pred + self.ref_blend * guide
+                # F=0 또는 V=0이면 guide 블렌딩 생략:
+                # gate_net이 pred≈0으로 만들었어도 guide(≠0)를 섞으면 신호가 새어 들어옴.
+                # contact 상태일 때만 guide를 blending한다.
+                _f_gain = float(np.clip((f_val - 0.3) / 1.7, 0.0, 1.0))
+                _v_gain = float(np.clip((v_val - 0.005) / 0.025, 0.0, 1.0))
+                if _f_gain * _v_gain < 1e-4:
+                    final = pred           # gate_net이 0으로 만든 pred 그대로
+                else:
+                    guide = self.get_guide_chunk(self.output_steps)
+                    final = (1.0 - self.ref_blend) * pred + self.ref_blend * guide
 
             self.acc_buf = np.roll(self.acc_buf, -self.output_steps)
             self.acc_buf[-self.output_steps:] = final
